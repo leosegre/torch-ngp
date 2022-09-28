@@ -23,7 +23,7 @@ if __name__ == '__main__':
     parser.add_argument('--iters', type=int, default=30000, help="training iters")
     parser.add_argument('--lr', type=float, default=1e-2, help="initial learning rate")
     parser.add_argument('--ckpt', type=str, default='latest')
-    parser.add_argument('--num_rays', type=int, default=4096, help="num rays sampled per image for each training step")
+    parser.add_argument('--num_rays', type=int, default=2048, help="num rays sampled per image for each training step")
     parser.add_argument('--cuda_ray', action='store_true', help="use CUDA raymarching instead of pytorch")
     parser.add_argument('--max_steps', type=int, default=1024, help="max num steps sampled per ray (only valid when using --cuda_ray)")
     parser.add_argument('--num_steps', type=int, default=512, help="num steps sampled per ray (only valid when NOT using --cuda_ray)")
@@ -62,6 +62,12 @@ if __name__ == '__main__':
     parser.add_argument('--clip_text', type=str, default='', help="text input for CLIP guidance")
     parser.add_argument('--rand_pose', type=int, default=-1, help="<0 uses no rand pose, =0 only uses rand pose, >0 sample one rand pose every $ known poses")
 
+    ### Semantic options
+    parser.add_argument('--num_classes', type=int, default=29, help="Number of semantic classes in dataset")
+    parser.add_argument('--lambda_s', type=float, default=1, help="Lambda to select the ratio between semantic loss and nerf loss")
+    parser.add_argument('--save_images', action='store_true', help="Save evaluated images to rundir")
+
+
     opt = parser.parse_args()
 
     if opt.O:
@@ -98,11 +104,13 @@ if __name__ == '__main__':
         min_near=opt.min_near,
         density_thresh=opt.density_thresh,
         bg_radius=opt.bg_radius,
+        num_classes=opt.num_classes,
     )
     
     print(model)
 
     criterion = torch.nn.MSELoss(reduction='none')
+    semantic_criterion = torch.nn.CrossEntropyLoss(reduction='none')
     #criterion = partial(huber_loss, reduction='none')
     #criterion = torch.nn.HuberLoss(reduction='none', beta=0.1) # only available after torch 1.10 ?
 
@@ -111,7 +119,7 @@ if __name__ == '__main__':
     if opt.test:
         
         metrics = [PSNRMeter(), LPIPSMeter(device=device)]
-        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, criterion=criterion, fp16=opt.fp16, metrics=metrics, use_checkpoint=opt.ckpt)
+        trainer = Trainer('ngp', opt, model, num_classes=opt.num_classes, lambda_s=opt.lambda_s, save_images=opt.save_images, device=device, workspace=opt.workspace, criterion=criterion, semantic_criterion=semantic_criterion, fp16=opt.fp16, metrics=metrics, use_checkpoint=opt.ckpt)
 
         if opt.gui:
             gui = NeRFGUI(opt, trainer)
@@ -137,7 +145,7 @@ if __name__ == '__main__':
         scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
 
         metrics = [PSNRMeter(), LPIPSMeter(device=device)]
-        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, scheduler_update_every_step=True, metrics=metrics, use_checkpoint=opt.ckpt, eval_interval=50)
+        trainer = Trainer('ngp', opt, model, num_classes=opt.num_classes, lambda_s=opt.lambda_s, save_images=opt.save_images, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, semantic_criterion=semantic_criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, scheduler_update_every_step=True, metrics=metrics, use_checkpoint=opt.ckpt, eval_interval=50)
 
         if opt.gui:
             gui = NeRFGUI(opt, trainer, train_loader)

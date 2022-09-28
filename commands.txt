@@ -1,0 +1,2 @@
+python main_nerf.py data/fox --workspace room0_test -O --test --scale 1.0 --bound 100.0 --dt_gamma 0.02 --tcnn
+python main_nerf.py data/fox --workspace room0_test -O --test --scale 1.0 --bound 100.0 --dt_gamma 0.02 --tcnn

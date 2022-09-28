@@ -18,7 +18,10 @@ class NeRFNetwork(NeRFRenderer):
                  geo_feat_dim=15,
                  num_layers_color=3,
                  hidden_dim_color=64,
+                 num_layers_semantic=3,
+                 hidden_dim_semantic=64,
                  bound=1,
+                 num_classes=92,
                  **kwargs
                  ):
         super().__init__(bound, **kwargs)
@@ -27,6 +30,7 @@ class NeRFNetwork(NeRFRenderer):
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
         self.geo_feat_dim = geo_feat_dim
+        self.num_classes = num_classes
 
         per_level_scale = np.exp2(np.log2(2048 * bound / 16) / (16 - 1))
 
@@ -80,6 +84,18 @@ class NeRFNetwork(NeRFRenderer):
             },
         )
 
+        self.semantic_net = tcnn.Network(
+            n_input_dims=self.geo_feat_dim,
+            n_output_dims=self.num_classes,
+            network_config={
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "None",
+                "n_neurons": hidden_dim_semantic,
+                "n_hidden_layers": num_layers_semantic - 1,
+            },
+        )
+
     
     def forward(self, x, d):
         # x: [N, 3], in [-bound, bound]
@@ -95,6 +111,11 @@ class NeRFNetwork(NeRFRenderer):
         sigma = trunc_exp(h[..., 0])
         geo_feat = h[..., 1:]
 
+        # semantics
+        semantic = self.semantic_net(geo_feat)
+        # Softmax for semantic segmentation
+        # semantic = torch.softmax(s, dim=1)
+
         # color
         d = (d + 1) / 2 # tcnn SH encoding requires inputs to be in [0, 1]
         d = self.encoder_dir(d)
@@ -106,7 +127,7 @@ class NeRFNetwork(NeRFRenderer):
         # sigmoid activation for rgb
         color = torch.sigmoid(h)
 
-        return sigma, color
+        return sigma, color, semantic
 
     def density(self, x):
         # x: [N, 3], in [-bound, bound]
@@ -124,7 +145,28 @@ class NeRFNetwork(NeRFRenderer):
             'geo_feat': geo_feat,
         }
 
-    # allow masked inference
+    def semantic(self, x):
+        # x: [N, 3], in [-bound, bound]
+
+        x = (x + self.bound) / (2 * self.bound) # to [0, 1]
+        x = self.encoder(x)
+        h = self.sigma_net(x)
+
+        #sigma = F.relu(h[..., 0])
+        sigma = trunc_exp(h[..., 0])
+        geo_feat = h[..., 1:]
+
+        # semantics
+        semantic = self.semantic_net(geo_feat)
+        # print(torch.topk(s, 2))
+
+        # Softmax for semantic segmentation
+        # semantic = torch.softmax(s, dim=1)
+        # if(semantic.max())
+        # print(semantic.max())
+
+        return semantic
+
     def color(self, x, d, mask=None, geo_feat=None, **kwargs):
         # x: [N, 3] in [-bound, bound]
         # mask: [N,], bool, indicates where we actually needs to compute rgb.
@@ -164,7 +206,8 @@ class NeRFNetwork(NeRFRenderer):
             {'params': self.encoder.parameters(), 'lr': lr},
             {'params': self.sigma_net.parameters(), 'lr': lr},
             {'params': self.encoder_dir.parameters(), 'lr': lr},
-            {'params': self.color_net.parameters(), 'lr': lr}, 
+            {'params': self.color_net.parameters(), 'lr': lr},
+            {'params': self.semantic_net.parameters(), 'lr': lr},
         ]
         if self.bg_radius > 0:
             params.append({'params': self.encoder_bg.parameters(), 'lr': lr})

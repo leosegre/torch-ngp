@@ -110,6 +110,9 @@ class NeRFRenderer(nn.Module):
     def color(self, x, d, mask=None, **kwargs):
         raise NotImplementedError()
 
+    def semantic(self, x):
+        raise NotImplementedError()
+
     def reset_extra_state(self):
         if not self.cuda_ray:
             return 
@@ -125,7 +128,7 @@ class NeRFRenderer(nn.Module):
     def run(self, rays_o, rays_d, num_steps=128, upsample_steps=128, bg_color=None, perturb=False, **kwargs):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
         # bg_color: [3] in range [0, 1]
-        # return: image: [B, N, 3], depth: [B, N]
+        # return: image: [B, N, 3], depth: [B, N], semantic_image: [B, N, num_classes]
 
         prefix = rays_o.shape[:-1]
         rays_o = rays_o.contiguous().view(-1, 3)
@@ -216,6 +219,9 @@ class NeRFRenderer(nn.Module):
         rgbs = self.color(xyzs.reshape(-1, 3), dirs.reshape(-1, 3), mask=mask.reshape(-1), **density_outputs)
         rgbs = rgbs.view(N, -1, 3) # [N, T+t, 3]
 
+        semantics = self.semantic(xyzs.reshape(-1, 3)) # [N * T+t, num_classes]
+        semantics = semantics.view(N, -1, self.num_classes) # [N, T+t, num_classes]
+
         #print(xyzs.shape, 'valid_rgb:', mask.sum().item())
 
         # calculate weight_sum (mask)
@@ -228,6 +234,9 @@ class NeRFRenderer(nn.Module):
         # calculate color
         image = torch.sum(weights.unsqueeze(-1) * rgbs, dim=-2) # [N, 3], in [0, 1]
 
+        # calculate semantics
+        semantic_image = torch.sum(weights.unsqueeze(-1) * semantics, dim=-2) # [N, num_classes]
+
         # mix background color
         if self.bg_radius > 0:
             # use the bg model to calculate bg_color
@@ -237,9 +246,11 @@ class NeRFRenderer(nn.Module):
             bg_color = 1
             
         image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
+        # semantic_image = semantic_image + (1 - weights_sum).unsqueeze(-1)
 
         image = image.view(*prefix, 3)
         depth = depth.view(*prefix)
+        semantic_image = semantic_image.view(*prefix, self.num_classes)
 
         # tmp: reg loss in mip-nerf 360
         # z_vals_shifted = torch.cat([z_vals[..., 1:], sample_dist * torch.ones_like(z_vals[..., :1])], dim=-1)
@@ -249,6 +260,7 @@ class NeRFRenderer(nn.Module):
         return {
             'depth': depth,
             'image': image,
+            'semantic_image': semantic_image,
             'weights_sum': weights_sum,
         }
 
@@ -287,7 +299,7 @@ class NeRFRenderer(nn.Module):
 
             #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
             
-            sigmas, rgbs = self(xyzs, dirs)
+            sigmas, rgbs, semantics = self(xyzs, dirs)
             # density_outputs = self.density(xyzs) # [M,], use a dict since it may include extra things, like geo_feat for rgb.
             # sigmas = density_outputs['sigma']
             # rgbs = self.color(xyzs, dirs, **density_outputs)
@@ -331,7 +343,8 @@ class NeRFRenderer(nn.Module):
             weights_sum = torch.zeros(N, dtype=dtype, device=device)
             depth = torch.zeros(N, dtype=dtype, device=device)
             image = torch.zeros(N, 3, dtype=dtype, device=device)
-            
+            semantic_image = torch.zeros(N, dtype=dtype, device=device)
+
             n_alive = N
             rays_alive = torch.arange(n_alive, dtype=torch.int32, device=device) # [N]
             rays_t = nears.clone() # [N]
@@ -352,13 +365,14 @@ class NeRFRenderer(nn.Module):
 
                 xyzs, dirs, deltas = raymarching.march_rays(n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, self.bound, self.density_bitfield, self.cascade, self.grid_size, nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps)
 
-                sigmas, rgbs = self(xyzs, dirs)
+                sigmas, rgbs, semantics = self(xyzs, dirs)
                 # density_outputs = self.density(xyzs) # [M,], use a dict since it may include extra things, like geo_feat for rgb.
                 # sigmas = density_outputs['sigma']
                 # rgbs = self.color(xyzs, dirs, **density_outputs)
                 sigmas = self.density_scale * sigmas
 
-                raymarching.composite_rays(n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, weights_sum, depth, image, T_thresh)
+                # raymarching.composite_rays(n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, weights_sum, depth, image, T_thresh)
+                raymarching.composite_rays(n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, semantics, deltas, weights_sum, depth, image, semantic_image, T_thresh)
 
                 rays_alive = rays_alive[rays_alive >= 0]
 
@@ -369,10 +383,12 @@ class NeRFRenderer(nn.Module):
             image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
             depth = torch.clamp(depth - nears, min=0) / (fars - nears)
             image = image.view(*prefix, 3)
+            semantic_image = semantic_image.view(*prefix)
             depth = depth.view(*prefix)
         
         results['depth'] = depth
         results['image'] = image
+        results['semantic_image'] = semantic_image
 
         return results
 
@@ -554,6 +570,7 @@ class NeRFRenderer(nn.Module):
         if staged and not self.cuda_ray:
             depth = torch.empty((B, N), device=device)
             image = torch.empty((B, N, 3), device=device)
+            semantic_image = torch.empty((B, N, self.num_classes), device=device)
 
             for b in range(B):
                 head = 0
@@ -562,11 +579,13 @@ class NeRFRenderer(nn.Module):
                     results_ = _run(rays_o[b:b+1, head:tail], rays_d[b:b+1, head:tail], **kwargs)
                     depth[b:b+1, head:tail] = results_['depth']
                     image[b:b+1, head:tail] = results_['image']
+                    semantic_image[b:b+1, head:tail] = results_['semantic_image']
                     head += max_ray_batch
             
             results = {}
             results['depth'] = depth
             results['image'] = image
+            results['semantic_image'] = semantic_image
 
         else:
             results = _run(rays_o, rays_d, **kwargs)

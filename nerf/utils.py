@@ -31,6 +31,9 @@ from torch_ema import ExponentialMovingAverage
 from packaging import version as pver
 import lpips
 
+from sklearn.metrics import confusion_matrix
+
+
 def custom_meshgrid(*args):
     # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
     if pver.parse(torch.__version__) < pver.parse('1.10'):
@@ -280,6 +283,9 @@ class Trainer(object):
                  opt, # extra conf
                  model, # network 
                  criterion=None, # loss function, if None, assume inline implementation in train_step
+                 semantic_criterion=None, # loss function, if None, assume inline implementation in train_step
+                 num_classes=99, # Number of semantic classes
+                 lambda_s=1, # Lambda to select ratio between semantic loss and nerf loss
                  optimizer=None, # optimizer
                  ema_decay=None, # if use EMA, set the decay
                  lr_scheduler=None, # scheduler
@@ -298,6 +304,7 @@ class Trainer(object):
                  use_checkpoint="latest", # which ckpt to use at init time
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
+                 save_images=True, # Save images to rundir
                  ):
         
         self.name = name
@@ -320,6 +327,9 @@ class Trainer(object):
         self.scheduler_update_every_step = scheduler_update_every_step
         self.device = device if device is not None else torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
         self.console = Console()
+        self.num_classes = num_classes
+        self.lambda_s = lambda_s
+        self.save_images = save_images
 
         model.to(self.device)
         if self.world_size > 1:
@@ -330,6 +340,7 @@ class Trainer(object):
         if isinstance(criterion, nn.Module):
             criterion.to(self.device)
         self.criterion = criterion
+        self.semantic_criterion = semantic_criterion
 
         # optionally use LPIPS loss for patch-based training
         if self.opt.patch_size > 1:
@@ -449,6 +460,7 @@ class Trainer(object):
             return pred_rgb, None, loss
 
         images = data['images'] # [B, N, 3/4]
+        semantic_images = data['semantics'] # [B, N, 1]
 
         B, N, C = images.shape
 
@@ -468,13 +480,23 @@ class Trainer(object):
         else:
             gt_rgb = images
 
+        gt_semantic = semantic_images
+
         # outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
         outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, **vars(self.opt))
     
         pred_rgb = outputs['image']
+        pred_semantic = outputs['semantic_image']
 
         # MSE loss
         loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
+
+        # Cross Entropy Loss
+        # pred_squeezed = pred_semantic.squeeze()
+        # gt_squeezed = gt_semantic.squeeze()
+        # print(gt_squeezed.max())
+        semantic_loss = self.semantic_criterion(pred_semantic.squeeze(), gt_semantic.squeeze()).mean(-1) # [B, N, 92] --> [B, N]
+
 
         # patch-based rendering
         if self.opt.patch_size > 1:
@@ -516,19 +538,21 @@ class Trainer(object):
             self.error_map[index] = error_map
 
         loss = loss.mean()
+        semantic_loss = semantic_loss.mean()
 
         # extra loss
         # pred_weights_sum = outputs['weights_sum'] + 1e-8
         # loss_ws = - 1e-1 * pred_weights_sum * torch.log(pred_weights_sum) # entropy to encourage weights_sum to be 0 or 1.
         # loss = loss + loss_ws.mean()
 
-        return pred_rgb, gt_rgb, loss
+        return pred_rgb, gt_rgb, loss, pred_semantic, gt_semantic, semantic_loss
 
     def eval_step(self, data):
 
         rays_o = data['rays_o'] # [B, N, 3]
         rays_d = data['rays_d'] # [B, N, 3]
         images = data['images'] # [B, H, W, 3/4]
+        semantic_images = data['semantics'] # [B, H, W, num_classes]
         B, H, W, C = images.shape
 
         if self.opt.color_space == 'linear':
@@ -540,15 +564,20 @@ class Trainer(object):
             gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
         else:
             gt_rgb = images
-        
+
+        gt_semantic = semantic_images
+
         outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **vars(self.opt))
 
         pred_rgb = outputs['image'].reshape(B, H, W, 3)
         pred_depth = outputs['depth'].reshape(B, H, W)
+        pred_semantic = outputs['semantic_image'].reshape(B, H, W, self.num_classes)
+
 
         loss = self.criterion(pred_rgb, gt_rgb).mean()
+        semantic_loss = self.semantic_criterion(pred_semantic.squeeze().view(-1, self.num_classes), gt_semantic.squeeze().view(-1)).mean(-1) # [B, N, 92] --> [B, N]
 
-        return pred_rgb, pred_depth, gt_rgb, loss
+        return pred_rgb, pred_depth, pred_semantic, gt_rgb, gt_semantic, loss, semantic_loss
 
     # moved out bg_color and perturb for more flexible control...
     def test_step(self, data, bg_color=None, perturb=False):  
@@ -564,8 +593,10 @@ class Trainer(object):
 
         pred_rgb = outputs['image'].reshape(-1, H, W, 3)
         pred_depth = outputs['depth'].reshape(-1, H, W)
+        pred_semantics = outputs['semantic_image'].reshape(-1, H, W, self.num_classes)
 
-        return pred_rgb, pred_depth
+
+        return pred_rgb, pred_depth, pred_semantics
 
 
     def save_mesh(self, save_path=None, resolution=256, threshold=10):
@@ -594,7 +625,8 @@ class Trainer(object):
 
     def train(self, train_loader, valid_loader, max_epochs):
         if self.use_tensorboardX and self.local_rank == 0:
-            self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name))
+            # self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name))
+            self.writer = tensorboardX.SummaryWriter()
 
         # mark untrained region (i.e., not covered by any camera from the training dataset)
         if self.model.cuda_ray:
@@ -641,13 +673,14 @@ class Trainer(object):
         if write_video:
             all_preds = []
             all_preds_depth = []
+            all_preds_semantic = []
 
         with torch.no_grad():
 
             for i, data in enumerate(loader):
                 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth = self.test_step(data)
+                    preds, preds_depth, preds_semantic = self.test_step(data)
 
                 if self.opt.color_space == 'linear':
                     preds = linear_to_srgb(preds)
@@ -658,12 +691,20 @@ class Trainer(object):
                 pred_depth = preds_depth[0].detach().cpu().numpy()
                 pred_depth = (pred_depth * 255).astype(np.uint8)
 
+                pred_semantic = preds_semantic[0].detach().cpu().numpy().argmax(axis=2)
+                print(pred_semantic.unique())
+                pred_semantic = (pred_semantic * 255).astype(np.uint8)
+
+
+
                 if write_video:
                     all_preds.append(pred)
                     all_preds_depth.append(pred_depth)
+                    all_preds_semantic.append(pred_semantic)
                 else:
                     cv2.imwrite(os.path.join(save_path, f'{name}_{i:04d}_rgb.png'), cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
                     cv2.imwrite(os.path.join(save_path, f'{name}_{i:04d}_depth.png'), pred_depth)
+                    cv2.imwrite(os.path.join(save_path, f'{name}_{i:04d}_semantic.png'), pred_semantic)
 
                 pbar.update(loader.batch_size)
         
@@ -681,7 +722,8 @@ class Trainer(object):
         self.model.train()
 
         total_loss = torch.tensor([0], dtype=torch.float32, device=self.device)
-        
+        total_semantic_loss = torch.tensor([0], dtype=torch.float32, device=self.device)
+
         loader = iter(train_loader)
 
         # mark untrained grid
@@ -707,9 +749,10 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
-         
-            self.scaler.scale(loss).backward()
+                preds, truths, loss, semantic_preds, semantic_truths, semantic_loss = self.train_step(data)
+
+            combined_loss = loss + self.lambda_s * semantic_loss
+            self.scaler.scale(combined_loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
             
@@ -717,20 +760,24 @@ class Trainer(object):
                 self.lr_scheduler.step()
 
             total_loss += loss.detach()
+            total_semantic_loss += semantic_loss.detach()
 
         if self.ema is not None:
             self.ema.update()
 
         average_loss = total_loss.item() / step
+        average_semantic_loss = total_semantic_loss.item() / step
+        average_loss_combined = average_loss + average_semantic_loss
 
         if not self.scheduler_update_every_step:
             if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                self.lr_scheduler.step(average_loss)
+                self.lr_scheduler.step(average_loss_combined)
             else:
                 self.lr_scheduler.step()
 
         outputs = {
             'loss': average_loss,
+            'semantic_loss': average_semantic_loss,
             'lr': self.optimizer.param_groups[0]['lr'],
         }
         
@@ -793,6 +840,7 @@ class Trainer(object):
         self.log(f"==> Start Training Epoch {self.epoch}, lr={self.optimizer.param_groups[0]['lr']:.6f} ...")
 
         total_loss = 0
+        total_semantic_loss = 0
         if self.local_rank == 0 and self.report_metric_at_train:
             for metric in self.metrics:
                 metric.clear()
@@ -822,9 +870,12 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
-         
-            self.scaler.scale(loss).backward()
+                preds, truths, loss, semantic_preds, semantic_truths, semantic_loss = self.train_step(data)
+
+            # print("lambda_s:", self.lambda_s)
+            combined_loss = loss + self.lambda_s * semantic_loss
+
+            self.scaler.scale(combined_loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -834,6 +885,9 @@ class Trainer(object):
             loss_val = loss.item()
             total_loss += loss_val
 
+            semantic_loss_val = semantic_loss.item()
+            total_semantic_loss += semantic_loss_val
+
             if self.local_rank == 0:
                 if self.report_metric_at_train:
                     for metric in self.metrics:
@@ -841,10 +895,11 @@ class Trainer(object):
                         
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/loss", loss_val, self.global_step)
+                    self.writer.add_scalar("train/semantic_loss", semantic_loss_val, self.global_step)
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
 
                 if self.scheduler_update_every_step:
-                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
+                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), semantic_loss={semantic_loss_val:.4f} ({total_semantic_loss/self.local_step:.4f}),lr={self.optimizer.param_groups[0]['lr']:.6f}")
                 else:
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
                 pbar.update(loader.batch_size)
@@ -854,6 +909,10 @@ class Trainer(object):
 
         average_loss = total_loss / self.local_step
         self.stats["loss"].append(average_loss)
+
+        average_semantic_loss = total_semantic_loss / self.local_step
+        average_loss_combined = average_loss + average_semantic_loss
+
 
         if self.local_rank == 0:
             pbar.close()
@@ -866,7 +925,7 @@ class Trainer(object):
 
         if not self.scheduler_update_every_step:
             if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                self.lr_scheduler.step(average_loss)
+                self.lr_scheduler.step(average_loss_combined)
             else:
                 self.lr_scheduler.step()
 
@@ -875,11 +934,14 @@ class Trainer(object):
 
     def evaluate_one_epoch(self, loader, name=None):
         self.log(f"++> Evaluate at epoch {self.epoch} ...")
+        logits_2_label = lambda x: torch.argmax(torch.nn.functional.softmax(x, dim=-1),dim=-1)
+
 
         if name is None:
             name = f'{self.name}_ep{self.epoch:04d}'
 
         total_loss = 0
+        total_semantic_loss = 0
         if self.local_rank == 0:
             for metric in self.metrics:
                 metric.clear()
@@ -895,12 +957,15 @@ class Trainer(object):
 
         with torch.no_grad():
             self.local_step = 0
+            self.miou = 0
+            self.total_accuracy = 0
+            self.class_average_accuracy = 0
 
             for data in loader:    
                 self.local_step += 1
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth, truths, loss = self.eval_step(data)
+                    preds, preds_depth, preds_semantic, truths, semantic_truths, loss, semantic_loss = self.eval_step(data)
 
                 # all_gather/reduce the statistics (NCCL only support all_*)
                 if self.world_size > 1:
@@ -922,6 +987,9 @@ class Trainer(object):
                 loss_val = loss.item()
                 total_loss += loss_val
 
+                semantic_loss_val = semantic_loss.item()
+                total_semantic_loss += semantic_loss_val
+
                 # only rank = 0 will perform evaluation.
                 if self.local_rank == 0:
 
@@ -930,7 +998,9 @@ class Trainer(object):
 
                     # save image
                     save_path = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_rgb.png')
+                    save_path_semantics = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_semantics.png')
                     save_path_depth = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_depth.png')
+                    save_path_semantics_gt = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_semantics_gt.png')
 
                     #self.log(f"==> Saving validation image to {save_path}")
                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -943,12 +1013,40 @@ class Trainer(object):
 
                     pred_depth = preds_depth[0].detach().cpu().numpy()
                     pred_depth = (pred_depth * 255).astype(np.uint8)
-                    
-                    cv2.imwrite(save_path, cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
-                    cv2.imwrite(save_path_depth, pred_depth)
 
-                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
+                    # pred_semantic = logits_2_label(preds_semantic[0]).detach().cpu().numpy()
+                    pred_semantic = preds_semantic[0].detach().cpu().numpy().argmax(axis=2)
+                    pred_semantic_num_classes = pred_semantic
+                    colour_map_np = nyu40_colour_code
+                    pred_semantic = colour_map_np[pred_semantic]
+
+                    semantic_gt = colour_map_np[semantic_truths[0].cpu().numpy().squeeze()]
+                    semantic_gt_num_classes = semantic_truths[0].cpu().numpy().squeeze()
+
+
+                    if self.save_images:
+                        cv2.imwrite(save_path, cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
+                        cv2.imwrite(save_path_depth, pred_depth)
+                        cv2.imwrite(save_path_semantics, pred_semantic)
+                        cv2.imwrite(save_path_semantics_gt, semantic_gt)
+
+                    # Calculate segmentation scores
+                    miou_test, miou_test_validclass, total_accuracy_test, class_average_accuracy_test, ious_test = \
+                    calculate_segmentation_metrics(true_labels=semantic_gt_num_classes, predicted_labels=pred_semantic_num_classes, number_classes=self.num_classes, ignore_label=0)
+
+                    self.miou += miou_test
+                    self.total_accuracy += total_accuracy_test
+                    self.class_average_accuracy += class_average_accuracy_test
+
+                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self. local_step:.4f}), miou_test={miou_test:.4f},"
+                                         f"total_accuracy_test={total_accuracy_test:.4f}, class_average_accuracy_test={class_average_accuracy_test:.4f},"
+                                         f" average_miou={self.miou/self.local_step:.4f}")
                     pbar.update(loader.batch_size)
+
+
+            self.miou /= self.local_step
+            self.total_accuracy /= self.local_step
+            self.class_average_accuracy /= self.local_step
 
 
         average_loss = total_loss / self.local_step
@@ -971,6 +1069,7 @@ class Trainer(object):
         if self.ema is not None:
             self.ema.restore()
 
+        self.log(f"++> mIoU: {self.miou:.4f}, total_accuracy: {self.total_accuracy:.4f}, class_average_accuracy: {self.class_average_accuracy:.4f}")
         self.log(f"++> Evaluate epoch {self.epoch} Finished.")
 
     def save_checkpoint(self, name=None, full=False, best=False, remove_old=True):
@@ -1096,3 +1195,96 @@ class Trainer(object):
                 self.log("[INFO] loaded scaler.")
             except:
                 self.log("[WARN] Failed to load scaler.")
+
+
+def nanmean(data, **args):
+    # This makes it ignore the first 'background' class
+    return np.ma.masked_array(data, np.isnan(data)).mean(**args)
+    # In np.ma.masked_array(data, np.isnan(data), elements of data == np.nan is invalid and will be ingorned during computation of np.mean()
+
+
+def calculate_segmentation_metrics(true_labels, predicted_labels, number_classes, ignore_label):
+    if (true_labels == ignore_label).all():
+        return [0] * 4
+
+    true_labels = true_labels.flatten()
+    predicted_labels = predicted_labels.flatten()
+    valid_pix_ids = true_labels != ignore_label
+    predicted_labels = predicted_labels[valid_pix_ids]
+    true_labels = true_labels[valid_pix_ids]
+
+    conf_mat = confusion_matrix(true_labels, predicted_labels, labels=list(range(number_classes)))
+    with np.errstate(divide='ignore',invalid='ignore'): # divide by 0, handled by missing_class_mask
+        norm_conf_mat = np.transpose(
+            np.transpose(conf_mat) / conf_mat.astype(np.float).sum(axis=1))
+
+    missing_class_mask = np.isnan(norm_conf_mat.sum(1))  # missing class will have NaN at corresponding class
+    exsiting_class_mask = ~ missing_class_mask
+
+    class_average_accuracy = nanmean(np.diagonal(norm_conf_mat))
+    total_accuracy = (np.sum(np.diagonal(conf_mat)) / np.sum(conf_mat))
+    ious = np.zeros(number_classes)
+    for class_id in range(number_classes):
+        if exsiting_class_mask[class_id]:
+            ious[class_id] = (conf_mat[class_id, class_id] / (
+                    np.sum(conf_mat[class_id, :]) + np.sum(conf_mat[:, class_id]) -
+                    conf_mat[class_id, class_id]))
+        else:
+            ious[class_id] = float("NaN")
+    miou = nanmean(ious)
+    miou_valid_class = np.mean(ious[exsiting_class_mask])
+    return miou, miou_valid_class, total_accuracy, class_average_accuracy, ious
+
+
+# color palette for nyu40 labels
+nyu40_colour_code = np.array([
+    (0, 0, 0),
+
+    (174, 199, 232),  # wall
+    (152, 223, 138),  # floor
+    (31, 119, 180),  # cabinet
+    (255, 187, 120),  # bed
+    (188, 189, 34),  # chair
+
+    (140, 86, 75),  # sofa
+    (255, 152, 150),  # table
+    (214, 39, 40),  # door
+    (197, 176, 213),  # window
+    (148, 103, 189),  # bookshelf
+
+    (196, 156, 148),  # picture
+    (23, 190, 207),  # counter
+    (178, 76, 76),  # blinds
+    (247, 182, 210),  # desk
+    (66, 188, 102),  # shelves
+
+    (219, 219, 141),  # curtain
+    (140, 57, 197),  # dresser
+    (202, 185, 52),  # pillow
+    (51, 176, 203),  # mirror
+    (200, 54, 131),  # floor
+
+    (92, 193, 61),  # clothes
+    (78, 71, 183),  # ceiling
+    (172, 114, 82),  # books
+    (255, 127, 14),  # refrigerator
+    (91, 163, 138),  # tv
+
+    (153, 98, 156),  # paper
+    (140, 153, 101),  # towel
+    (158, 218, 229),  # shower curtain
+    (100, 125, 154),  # box
+    (178, 127, 135),  # white board
+
+    (120, 185, 128),  # person
+    (146, 111, 194),  # night stand
+    (44, 160, 44),  # toilet
+    (112, 128, 144),  # sink
+    (96, 207, 209),  # lamp
+
+    (227, 119, 194),  # bathtub
+    (213, 92, 176),  # bag
+    (94, 106, 211),  # other struct
+    (82, 84, 163),  # otherfurn
+    (100, 85, 144)  # other prop
+]).astype(np.uint8)

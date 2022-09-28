@@ -192,19 +192,29 @@ class NeRFDataset:
             
             self.poses = []
             self.images = []
+            self.semantics = []
             for f in tqdm.tqdm(frames, desc=f'Loading {type} data'):
                 f_path = os.path.join(self.root_path, f['file_path'])
+                s_path = os.path.join(self.root_path, f['semantic_path'])
                 if self.mode == 'blender' and '.' not in os.path.basename(f_path):
                     f_path += '.png' # so silly...
 
                 # there are non-exist paths in fox...
                 if not os.path.exists(f_path):
+                    print("The file", f_path, "does not exist")
                     continue
-                
+
+                # there are non-exist paths in Semantic...
+                if not os.path.exists(s_path):
+                    print("The file", s_path, "does not exist")
+                    continue
+
                 pose = np.array(f['transform_matrix'], dtype=np.float32) # [4, 4]
                 pose = nerf_matrix_to_ngp(pose, scale=self.scale, offset=self.offset)
 
                 image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
+                semantic = cv2.imread(s_path, cv2.IMREAD_GRAYSCALE) # [H, W]
+                semantic = np.expand_dims(semantic, axis=2) # [H, W, 1]
                 if self.H is None or self.W is None:
                     self.H = image.shape[0] // downscale
                     self.W = image.shape[1] // downscale
@@ -217,16 +227,27 @@ class NeRFDataset:
 
                 if image.shape[0] != self.H or image.shape[1] != self.W:
                     image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
-                    
+                    semantic = cv2.resize(semantic, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
+
                 image = image.astype(np.float32) / 255 # [H, W, 3/4]
 
                 self.poses.append(pose)
                 self.images.append(image)
-            
+                self.semantics.append(semantic)
+
         self.poses = torch.from_numpy(np.stack(self.poses, axis=0)) # [N, 4, 4]
         if self.images is not None:
             self.images = torch.from_numpy(np.stack(self.images, axis=0)) # [N, H, W, C]
-        
+        if self.semantics is not None:
+            self.semantics = torch.from_numpy(np.stack(self.semantics, axis=0)) # [N, H, W, 1]
+
+        # Calculate number of semantic classes
+        self.semantic_classes = np.unique(self.semantics).astype(np.uint8)
+        self.num_semantic_class = self.semantic_classes.shape[0]  # number of semantic classes, including the void class of 0
+        print("num_semantic_class:", self.num_semantic_class)
+        print("max_semantic_label:", self.semantics.max())
+        print("Unique semantics:", self.semantic_classes)
+
         # calculate mean radius of all camera poses
         self.radius = self.poses[:, :3, 3].norm(dim=-1).mean(0).item()
         #print(f'[INFO] dataset camera poses: radius = {self.radius:.4f}, bound = {self.bound}')
@@ -252,6 +273,7 @@ class NeRFDataset:
                 else:
                     dtype = torch.float
                 self.images = self.images.to(dtype).to(self.device)
+                self.semantics = self.semantics.to(self.device)
             if self.error_map is not None:
                 self.error_map = self.error_map.to(self.device)
 
@@ -314,6 +336,16 @@ class NeRFDataset:
                 C = images.shape[-1]
                 images = torch.gather(images.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
             results['images'] = images
+
+        if self.semantics is not None:
+            semantics = self.semantics[index].to(self.device) # [B, H, W, 1]
+            if self.training:
+                semantics = torch.gather(semantics.view(B, -1, 1), 1, torch.stack([rays['inds']], -1)) # [B, N, 1]
+            # TODO: change segmentation map to more general cases
+            seg_map = [0, 3, 11, 12, 13, 18, 19, 20, 29, 31, 37, 40, 44, 47, 59, 60, 63, 64, 65, 76, 78, 79, 80, 91, 92, 93, 95, 97, 98]
+            for i in range(len(seg_map)):
+                semantics[semantics == seg_map[i]] = i
+            results['semantics'] = semantics
         
         # need inds to update error_map
         if error_map is not None:
