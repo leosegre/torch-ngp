@@ -18,13 +18,19 @@ class NeRFNetwork(NeRFRenderer):
                  geo_feat_dim=15,
                  num_layers_color=3,
                  hidden_dim_color=64,
-                 num_layers_semantic=3,
-                 hidden_dim_semantic=64,
+                 num_layers_semantic=6,
+                 hidden_dim_semantic=128,
                  bound=1,
                  num_classes=92,
+                 no_seg=False,
+                 only_seg=False,
                  **kwargs
                  ):
         super().__init__(bound, **kwargs)
+
+        # Options
+        self.no_seg = no_seg
+        self.only_seg = only_seg
 
         # sigma network
         self.num_layers = num_layers
@@ -59,7 +65,7 @@ class NeRFNetwork(NeRFRenderer):
         )
 
         # color network
-        self.num_layers_color = num_layers_color        
+        self.num_layers_color = num_layers_color
         self.hidden_dim_color = hidden_dim_color
 
         self.encoder_dir = tcnn.Encoding(
@@ -96,34 +102,33 @@ class NeRFNetwork(NeRFRenderer):
             },
         )
 
-    
     def forward(self, x, d):
         # x: [N, 3], in [-bound, bound]
         # d: [N, 3], nomalized in [-1, 1]
 
-
         # sigma
-        x = (x + self.bound) / (2 * self.bound) # to [0, 1]
+        x = (x + self.bound) / (2 * self.bound)  # to [0, 1]
         x = self.encoder(x)
         h = self.sigma_net(x)
 
-        #sigma = F.relu(h[..., 0])
+        # sigma = F.relu(h[..., 0])
         sigma = trunc_exp(h[..., 0])
         geo_feat = h[..., 1:]
 
         # semantics
         semantic = self.semantic_net(geo_feat)
         # Softmax for semantic segmentation
-        # semantic = torch.softmax(s, dim=1)
+        semantic = torch.log_softmax(semantic, dim=1)
+        # semantic = torch.softmax(semantic, dim=1)
 
         # color
-        d = (d + 1) / 2 # tcnn SH encoding requires inputs to be in [0, 1]
+        d = (d + 1) / 2  # tcnn SH encoding requires inputs to be in [0, 1]
         d = self.encoder_dir(d)
 
-        #p = torch.zeros_like(geo_feat[..., :1]) # manual input padding
+        # p = torch.zeros_like(geo_feat[..., :1]) # manual input padding
         h = torch.cat([d, geo_feat], dim=-1)
         h = self.color_net(h)
-        
+
         # sigmoid activation for rgb
         color = torch.sigmoid(h)
 
@@ -132,11 +137,11 @@ class NeRFNetwork(NeRFRenderer):
     def density(self, x):
         # x: [N, 3], in [-bound, bound]
 
-        x = (x + self.bound) / (2 * self.bound) # to [0, 1]
+        x = (x + self.bound) / (2 * self.bound)  # to [0, 1]
         x = self.encoder(x)
         h = self.sigma_net(x)
 
-        #sigma = F.relu(h[..., 0])
+        # sigma = F.relu(h[..., 0])
         sigma = trunc_exp(h[..., 0])
         geo_feat = h[..., 1:]
 
@@ -145,25 +150,39 @@ class NeRFNetwork(NeRFRenderer):
             'geo_feat': geo_feat,
         }
 
-    def semantic(self, x):
+    def semantic(self, x, mask=None):
         # x: [N, 3], in [-bound, bound]
 
-        x = (x + self.bound) / (2 * self.bound) # to [0, 1]
+        x = (x + self.bound) / (2 * self.bound)  # to [0, 1]
+
+        if mask is not None:
+            semantic = torch.zeros(mask.shape[0], self.num_classes, dtype=x.dtype, device=x.device)  # [N, 3]
+            # in case of empty mask
+            if not mask.any():
+                return semantic
+            x = x[mask]
+
         x = self.encoder(x)
         h = self.sigma_net(x)
 
-        #sigma = F.relu(h[..., 0])
+        # sigma = F.relu(h[..., 0])
         sigma = trunc_exp(h[..., 0])
         geo_feat = h[..., 1:]
 
         # semantics
-        semantic = self.semantic_net(geo_feat)
+        s = self.semantic_net(geo_feat)
         # print(torch.topk(s, 2))
 
         # Softmax for semantic segmentation
-        # semantic = torch.softmax(s, dim=1)
+        semantic = torch.log_softmax(semantic, dim=1)
+        # semantic = torch.softmax(semantic, dim=1)
         # if(semantic.max())
         # print(semantic.max())
+
+        if mask is not None:
+            semantic[mask] = s.to(semantic.dtype)  # fp16 --> fp32
+        else:
+            semantic = s
 
         return semantic
 
@@ -171,10 +190,10 @@ class NeRFNetwork(NeRFRenderer):
         # x: [N, 3] in [-bound, bound]
         # mask: [N,], bool, indicates where we actually needs to compute rgb.
 
-        x = (x + self.bound) / (2 * self.bound) # to [0, 1]
+        x = (x + self.bound) / (2 * self.bound)  # to [0, 1]
 
         if mask is not None:
-            rgbs = torch.zeros(mask.shape[0], 3, dtype=x.dtype, device=x.device) # [N, 3]
+            rgbs = torch.zeros(mask.shape[0], 3, dtype=x.dtype, device=x.device)  # [N, 3]
             # in case of empty mask
             if not mask.any():
                 return rgbs
@@ -183,34 +202,44 @@ class NeRFNetwork(NeRFRenderer):
             geo_feat = geo_feat[mask]
 
         # color
-        d = (d + 1) / 2 # tcnn SH encoding requires inputs to be in [0, 1]
+        d = (d + 1) / 2  # tcnn SH encoding requires inputs to be in [0, 1]
         d = self.encoder_dir(d)
 
         h = torch.cat([d, geo_feat], dim=-1)
         h = self.color_net(h)
-        
+
         # sigmoid activation for rgb
         h = torch.sigmoid(h)
 
         if mask is not None:
-            rgbs[mask] = h.to(rgbs.dtype) # fp16 --> fp32
+            rgbs[mask] = h.to(rgbs.dtype)  # fp16 --> fp32
         else:
             rgbs = h
 
-        return rgbs        
+        return rgbs
 
-    # optimizer utils
+        # optimizer utils
+
     def get_params(self, lr):
-
-        params = [
-            {'params': self.encoder.parameters(), 'lr': lr},
-            {'params': self.sigma_net.parameters(), 'lr': lr},
-            {'params': self.encoder_dir.parameters(), 'lr': lr},
-            {'params': self.color_net.parameters(), 'lr': lr},
-            {'params': self.semantic_net.parameters(), 'lr': lr},
-        ]
+        if self.only_seg:
+            params = [{'params': self.semantic_net.parameters(), 'lr': lr}]
+        elif self.no_seg:
+            params = [
+                {'params': self.encoder.parameters(), 'lr': lr},
+                {'params': self.sigma_net.parameters(), 'lr': lr},
+                {'params': self.encoder_dir.parameters(), 'lr': lr},
+                {'params': self.color_net.parameters(), 'lr': lr}
+            ]
+        else:
+            params = [
+                {'params': self.encoder.parameters(), 'lr': lr},
+                {'params': self.sigma_net.parameters(), 'lr': lr},
+                {'params': self.encoder_dir.parameters(), 'lr': lr},
+                {'params': self.color_net.parameters(), 'lr': lr},
+                {'params': self.semantic_net.parameters(), 'lr': lr},
+            ]
         if self.bg_radius > 0:
             params.append({'params': self.encoder_bg.parameters(), 'lr': lr})
             params.append({'params': self.bg_net.parameters(), 'lr': lr})
-        
+
         return params

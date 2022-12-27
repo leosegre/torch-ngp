@@ -238,7 +238,7 @@ march_rays_train = _march_rays_train.apply
 class _composite_rays_train(Function):
     @staticmethod
     @custom_fwd(cast_inputs=torch.float32)
-    def forward(ctx, sigmas, rgbs, deltas, rays, T_thresh=1e-4):
+    def forward(ctx, sigmas, rgbs, classes, deltas, rays, num_classes, T_thresh=1e-4):
         ''' composite rays' rgbs, according to the ray marching formula.
         Args:
             rgbs: float, [M, 3]
@@ -253,6 +253,7 @@ class _composite_rays_train(Function):
         
         sigmas = sigmas.contiguous()
         rgbs = rgbs.contiguous()
+        classes = classes.contiguous()
 
         M = sigmas.shape[0]
         N = rays.shape[0]
@@ -260,32 +261,36 @@ class _composite_rays_train(Function):
         weights_sum = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
         depth = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
         image = torch.empty(N, 3, dtype=sigmas.dtype, device=sigmas.device)
+        semantic_image = torch.empty(N, num_classes, dtype=sigmas.dtype, device=sigmas.device)
 
-        _backend.composite_rays_train_forward(sigmas, rgbs, deltas, rays, M, N, T_thresh, weights_sum, depth, image)
+        _backend.composite_rays_train_forward(sigmas, rgbs, classes, deltas, rays, num_classes, M, N, T_thresh, weights_sum, depth, image, semantic_image)
 
-        ctx.save_for_backward(sigmas, rgbs, deltas, rays, weights_sum, depth, image)
+        ctx.save_for_backward(sigmas, rgbs, classes, deltas, rays, weights_sum, depth, image, semantic_image)
         ctx.dims = [M, N, T_thresh]
 
-        return weights_sum, depth, image
+        return weights_sum, depth, image, semantic_image
     
     @staticmethod
     @custom_bwd
-    def backward(ctx, grad_weights_sum, grad_depth, grad_image):
+    def backward(ctx, grad_weights_sum, grad_depth, grad_image, grad_semantic_image):
 
         # NOTE: grad_depth is not used now! It won't be propagated to sigmas.
+        num_classes = grad_semantic_image.shape[1]
 
         grad_weights_sum = grad_weights_sum.contiguous()
         grad_image = grad_image.contiguous()
+        grad_semantic_image = grad_semantic_image.contiguous()
 
-        sigmas, rgbs, deltas, rays, weights_sum, depth, image = ctx.saved_tensors
+        sigmas, rgbs, classes, deltas, rays, weights_sum, depth, image, semantic_image = ctx.saved_tensors
         M, N, T_thresh = ctx.dims
    
         grad_sigmas = torch.zeros_like(sigmas)
         grad_rgbs = torch.zeros_like(rgbs)
+        grad_classes = torch.zeros_like(classes)
 
-        _backend.composite_rays_train_backward(grad_weights_sum, grad_image, sigmas, rgbs, deltas, rays, weights_sum, image, M, N, T_thresh, grad_sigmas, grad_rgbs)
+        _backend.composite_rays_train_backward(grad_weights_sum, grad_image, grad_semantic_image, sigmas, rgbs, classes, deltas, rays, num_classes, weights_sum, image, semantic_image, M, N, T_thresh, grad_sigmas, grad_rgbs, grad_classes)
 
-        return grad_sigmas, grad_rgbs, None, None, None
+        return grad_sigmas, grad_rgbs, grad_classes, None, None, None, None
 
 
 composite_rays_train = _composite_rays_train.apply
@@ -351,7 +356,7 @@ march_rays = _march_rays.apply
 class _composite_rays(Function):
     @staticmethod
     @custom_fwd(cast_inputs=torch.float32) # need to cast sigmas & rgbs to float
-    def forward(ctx, n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, weights_sum, depth, image, T_thresh=1e-2):
+    def forward(ctx, n_alive, n_step, rays_alive, rays_t, num_classes , sigmas, rgbs, classes, deltas, weights_sum, depth, image, semantic_image, T_thresh=1e-2):
         ''' composite rays' rgbs, according to the ray marching formula. (for inference)
         Args:
             n_alive: int, number of alive rays
@@ -366,7 +371,12 @@ class _composite_rays(Function):
             depth: float, [N,], the depth value
             image: float, [N, 3], the RGB channel (after multiplying alpha!)
         '''
-        _backend.composite_rays(n_alive, n_step, T_thresh, rays_alive, rays_t, sigmas, rgbs, deltas, weights_sum, depth, image)
+        # print("rgbs", rgbs.shape)
+        # print("classes", classes.shape)
+        # print("image", image.shape)
+        # print("semantic_image", semantic_image.shape)
+        # print(num_classes)
+        _backend.composite_rays(n_alive, n_step, T_thresh, rays_alive, rays_t, num_classes, sigmas, rgbs, classes, deltas, weights_sum, depth, image, semantic_image)
         return tuple()
 
 

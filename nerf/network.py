@@ -121,7 +121,7 @@ class NeRFNetwork(NeRFRenderer):
         # sigmoid activation for rgb
         color = torch.sigmoid(h)
 
-        return sigma, color
+        return sigma, color, color # TODO: Add semantics
 
     def density(self, x):
         # x: [N, 3], in [-bound, bound]

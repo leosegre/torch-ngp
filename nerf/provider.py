@@ -92,7 +92,7 @@ def rand_poses(size, device, radius=1, theta_range=[np.pi/3, 2*np.pi/3], phi_ran
 
 
 class NeRFDataset:
-    def __init__(self, opt, device, type='train', downscale=1, n_test=10):
+    def __init__(self, opt, device, type='train', downscale=1, n_test=10, num_classes=6, use_class_vector=False):
         super().__init__()
         
         self.opt = opt
@@ -105,6 +105,8 @@ class NeRFDataset:
         self.offset = opt.offset # camera offset
         self.bound = opt.bound # bounding box half length, also used as the radius to random sample poses.
         self.fp16 = opt.fp16 # if preload, load into fp16.
+        self.num_classes = num_classes
+        self.use_class_vector = use_class_vector
 
         self.training = self.type in ['train', 'all', 'trainval']
         self.num_rays = self.opt.num_rays if self.training else -1
@@ -144,8 +146,14 @@ class NeRFDataset:
                 transform['frames'].extend(transform_val['frames'])
             # only load one specified split
             else:
-                with open(os.path.join(self.root_path, f'transforms_{type}.json'), 'r') as f:
-                    transform = json.load(f)
+                if self.opt.generate:
+                    with open(os.path.join(self.root_path, f'transforms_to_generate.json'), 'r') as f:
+                        print(f.name)
+                        transform = json.load(f)
+                else:
+                    with open(os.path.join(self.root_path, f'transforms_{type}.json'), 'r') as f:
+                        print(f.name)
+                        transform = json.load(f)
 
         else:
             raise NotImplementedError(f'unknown dataset mode: {self.mode}')
@@ -200,24 +208,43 @@ class NeRFDataset:
                     f_path += '.png' # so silly...
 
                 # there are non-exist paths in fox...
-                if not os.path.exists(f_path):
+                if not os.path.exists(f_path) and not self.opt.generate:
                     print("The file", f_path, "does not exist")
                     continue
 
                 # there are non-exist paths in Semantic...
-                if not os.path.exists(s_path):
+                if not os.path.exists(s_path) and not self.opt.generate:
                     print("The file", s_path, "does not exist")
                     continue
 
                 pose = np.array(f['transform_matrix'], dtype=np.float32) # [4, 4]
-                pose = nerf_matrix_to_ngp(pose, scale=self.scale, offset=self.offset)
+                if not self.opt.generate:
+                    pose = nerf_matrix_to_ngp(pose, scale=self.scale, offset=self.offset)
 
-                image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
-                semantic = cv2.imread(s_path, cv2.IMREAD_GRAYSCALE) # [H, W]
-                semantic = np.expand_dims(semantic, axis=2) # [H, W, 1]
-                if self.H is None or self.W is None:
-                    self.H = image.shape[0] // downscale
-                    self.W = image.shape[1] // downscale
+                if self.opt.generate:
+                    image = np.zeros((256, 256, 3), np.uint8)
+                else:
+                    image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
+
+                if self.opt.generate:
+                    semantic = np.zeros((256, 256, 1), np.uint8)
+                else:
+                    if self.use_class_vector:
+                        for class_num in range(self.num_classes):
+                            s_path_class = s_path.split('.')[0]+"_"+str(class_num)+"."+s_path.split('.')[-1]
+                            temp_semantic = cv2.imread(s_path_class, cv2.IMREAD_GRAYSCALE) # [H, W]
+                            if class_num == 0:
+                                semantic = np.expand_dims(temp_semantic, axis=2)  # [H, W, 1]
+                            else:
+                                temp_semantic = np.expand_dims(temp_semantic, axis=2)  # [H, W, 1]
+                                semantic = np.concatenate((semantic, temp_semantic), axis=2)
+                        semantic = (semantic / 255)  # Normalize and use floating point
+                    else:
+                        semantic = cv2.imread(s_path, cv2.IMREAD_GRAYSCALE) # [H, W]
+                        semantic = np.expand_dims(semantic, axis=2) # [H, W, 1]
+                    if self.H is None or self.W is None:
+                        self.H = image.shape[0] // downscale
+                        self.W = image.shape[1] // downscale
 
                 # add support for the alpha channel as a mask.
                 if image.shape[-1] == 3: 
@@ -242,7 +269,7 @@ class NeRFDataset:
             self.semantics = torch.from_numpy(np.stack(self.semantics, axis=0)) # [N, H, W, 1]
 
         # Calculate number of semantic classes
-        self.semantic_classes = np.unique(self.semantics).astype(np.uint8)
+        self.semantic_classes = np.unique(self.semantics)
         self.num_semantic_class = self.semantic_classes.shape[0]  # number of semantic classes, including the void class of 0
         print("num_semantic_class:", self.num_semantic_class)
         print("max_semantic_label:", self.semantics.max())
@@ -339,10 +366,20 @@ class NeRFDataset:
 
         if self.semantics is not None:
             semantics = self.semantics[index].to(self.device) # [B, H, W, 1]
-            if self.training:
-                semantics = torch.gather(semantics.view(B, -1, 1), 1, torch.stack([rays['inds']], -1)) # [B, N, 1]
             # TODO: change segmentation map to more general cases
-            seg_map = [0, 3, 11, 12, 13, 18, 19, 20, 29, 31, 37, 40, 44, 47, 59, 60, 63, 64, 65, 76, 78, 79, 80, 91, 92, 93, 95, 97, 98]
+            # seg_map = [0, 3, 11, 12, 13, 18, 19, 20, 29, 31, 37, 40, 44, 47, 59, 60, 63, 64, 65, 76, 78, 79, 80, 91, 92, 93, 95, 97, 98]
+            # seg_map = [0, 1, 2, 3, 4, 5]
+            seg_map = [0, 97, 193, 144, 157, 61]
+            # for i in range(len(seg_map)):
+            #     temp_semantics = (semantics == seg_map[i])
+            #     temp_semantics = temp_semantics.cpu().numpy()[0] * 256
+            #     cv2.imwrite("./labeling_test/"+str(seg_map[i])+".png", temp_semantics)
+
+            if self.training:
+                if self.use_class_vector:
+                    semantics = torch.gather(semantics.view(B, -1, self.num_classes), 1, torch.stack(self.num_classes * [rays['inds']], -1)) # [B, N, 1]
+                else:
+                    semantics = torch.gather(semantics.view(B, -1, 1), 1, torch.stack([rays['inds']], -1)) # [B, N, num_classes]
             for i in range(len(seg_map)):
                 semantics[semantics == seg_map[i]] = i
             results['semantics'] = semantics

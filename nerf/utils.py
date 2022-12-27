@@ -305,6 +305,8 @@ class Trainer(object):
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
                  save_images=True, # Save images to rundir
+                 use_class_vector=False,
+                 no_seg=False
                  ):
         
         self.name = name
@@ -330,6 +332,8 @@ class Trainer(object):
         self.num_classes = num_classes
         self.lambda_s = lambda_s
         self.save_images = save_images
+        self.use_class_vector = use_class_vector
+        self.no_seg = no_seg
 
         model.to(self.device)
         if self.world_size > 1:
@@ -456,7 +460,7 @@ class Trainer(object):
             #torch_vis_2d(pred_rgb[0])
 
             loss = self.clip_loss(pred_rgb)
-            
+
             return pred_rgb, None, loss
 
         images = data['images'] # [B, N, 3/4]
@@ -471,22 +475,27 @@ class Trainer(object):
             bg_color = 1
         # train with random background color if not using a bg model and has alpha channel.
         else:
-            #bg_color = torch.ones(3, device=self.device) # [3], fixed white background
+            bg_color = torch.ones(3, device=self.device) # [3], fixed white background
             #bg_color = torch.rand(3, device=self.device) # [3], frame-wise random.
-            bg_color = torch.rand_like(images[..., :3]) # [N, 3], pixel-wise random.
+            # bg_color = torch.rand_like(images[..., :3]) # [N, 3], pixel-wise random.
 
         if C == 4:
             gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
         else:
             gt_rgb = images
 
+
         gt_semantic = semantic_images
 
         # outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
         outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, **vars(self.opt))
-    
+
         pred_rgb = outputs['image']
-        pred_semantic = outputs['semantic_image']
+
+        if not self.no_seg:
+            pred_semantic = outputs['semantic_image']
+        else:
+            pred_semantic = None
 
         # MSE loss
         loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
@@ -495,7 +504,26 @@ class Trainer(object):
         # pred_squeezed = pred_semantic.squeeze()
         # gt_squeezed = gt_semantic.squeeze()
         # print(gt_squeezed.max())
-        semantic_loss = self.semantic_criterion(pred_semantic.squeeze(), gt_semantic.squeeze()).mean(-1) # [B, N, 92] --> [B, N]
+        # print(gt_semantic.max(axis=2)[0].min())
+        if not self.no_seg:
+            if self.use_class_vector:
+                gt_semantic_label = gt_semantic.squeeze().argmax(axis=1)
+                gt_semantic_label_confidence = gt_semantic.squeeze().max(axis=1)[0]
+                confidence_threshold = 0.99
+                confidence_mask = gt_semantic_label_confidence >= confidence_threshold
+                gt_semantic_softmax = gt_semantic.squeeze().log_softmax(dim=1, dtype=torch.float32)
+                # print()
+                # print(" gt_semantic.squeeze().sum(axis=1):", gt_semantic.squeeze().sum(axis=1))
+                # print("gt_semantic_softmax:", gt_semantic_softmax[0])
+                # print(confidence_mask.sum())
+                # semantic_loss = (self.semantic_criterion(pred_semantic.squeeze(), gt_semantic_label) * confidence_mask).mean(-1) # [B, N, 92] --> [B, N]
+                # print("pred_semantic", pred_semantic.dtype)
+                # print("gt_semantic_softmax", gt_semantic_softmax.dtype)
+                semantic_loss = (self.semantic_criterion(pred_semantic.squeeze(), gt_semantic_softmax)).mean(-1) # [B, N, 92] --> [B, N]
+            else:
+                # print("pred_semantic:", pred_semantic.shape)
+                # print("gt_semantic:", gt_semantic.shape)
+                semantic_loss = self.semantic_criterion(pred_semantic.squeeze(), gt_semantic.squeeze()).mean(-1) # [B, N, 92] --> [B, N]
 
 
         # patch-based rendering
@@ -507,7 +535,8 @@ class Trainer(object):
             # torch_vis_2d(pred_rgb[0])
 
             # LPIPS loss [not useful...]
-            loss = loss + 1e-3 * self.criterion_lpips(pred_rgb, gt_rgb)
+            if not self.no_seg:
+                loss = loss + 1e-3 * self.criterion_lpips(pred_rgb, gt_rgb)
 
         # special case for CCNeRF's rank-residual training
         if len(loss.shape) == 3: # [K, B, N]
@@ -529,7 +558,7 @@ class Trainer(object):
             #     cv2.imwrite(os.path.join(self.workspace, f'{self.global_step}.jpg'), (tmp * 255).astype(np.uint8))
 
             error = loss.detach().to(error_map.device) # [B, N], already in [0, 1]
-            
+
             # ema update
             ema_error = 0.1 * error_map.gather(1, inds) + 0.9 * error
             error_map.scatter_(1, inds, ema_error)
@@ -538,7 +567,13 @@ class Trainer(object):
             self.error_map[index] = error_map
 
         loss = loss.mean()
-        semantic_loss = semantic_loss.mean()
+        if not self.no_seg:
+            semantic_loss = semantic_loss.mean()
+        else:
+            semantic_loss = 0
+
+        if self.opt.only_seg:
+            loss = 0
 
         # extra loss
         # pred_weights_sum = outputs['weights_sum'] + 1e-8
@@ -553,10 +588,12 @@ class Trainer(object):
         rays_d = data['rays_d'] # [B, N, 3]
         images = data['images'] # [B, H, W, 3/4]
         semantic_images = data['semantics'] # [B, H, W, num_classes]
+
         B, H, W, C = images.shape
 
         if self.opt.color_space == 'linear':
             images[..., :3] = srgb_to_linear(images[..., :3])
+
 
         # eval with fixed background color
         bg_color = 1
@@ -565,17 +602,40 @@ class Trainer(object):
         else:
             gt_rgb = images
 
+
         gt_semantic = semantic_images
 
         outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **vars(self.opt))
 
         pred_rgb = outputs['image'].reshape(B, H, W, 3)
         pred_depth = outputs['depth'].reshape(B, H, W)
-        pred_semantic = outputs['semantic_image'].reshape(B, H, W, self.num_classes)
+        if not self.no_seg:
+            pred_semantic = outputs['semantic_image'].reshape(B, H, W, self.num_classes)
+        else:
+            pred_semantic = None
+
+        # print(pred_rgb)
 
 
         loss = self.criterion(pred_rgb, gt_rgb).mean()
-        semantic_loss = self.semantic_criterion(pred_semantic.squeeze().view(-1, self.num_classes), gt_semantic.squeeze().view(-1)).mean(-1) # [B, N, 92] --> [B, N]
+        # print("pred_semantic:", pred_semantic.shape)
+        # print("gt_semantic:", gt_semantic)
+        if not self.no_seg:
+            if self.use_class_vector:
+                gt_semantic_label = gt_semantic.squeeze().argmax(axis=1)
+                gt_semantic_label_confidence = gt_semantic.squeeze().max(axis=1)[0]
+                confidence_threshold = 0.99
+                confidence_mask = gt_semantic_label_confidence >= confidence_threshold
+                # gt_semantic_softmax = gt_semantic.squeeze().softmax(dim=1)
+                # semantic_loss = (self.semantic_criterion(pred_semantic.squeeze(), gt_semantic_label) * confidence_mask).mean(-1) # [B, N, 92] --> [B, N]
+                semantic_loss = (self.semantic_criterion(pred_semantic.squeeze(), gt_semantic.squeeze())).mean(-1) # [B, N, 92] --> [B, N]
+            else:
+                semantic_loss = self.semantic_criterion(pred_semantic.squeeze().reshape((H*W, self.num_classes)), gt_semantic.squeeze().flatten()).mean(-1) # [B, N, 92] --> [B, N]
+
+        if not self.no_seg:
+            semantic_loss = semantic_loss.mean()
+        else:
+            semantic_loss = 0
 
         return pred_rgb, pred_depth, pred_semantic, gt_rgb, gt_semantic, loss, semantic_loss
 
@@ -692,7 +752,6 @@ class Trainer(object):
                 pred_depth = (pred_depth * 255).astype(np.uint8)
 
                 pred_semantic = preds_semantic[0].detach().cpu().numpy().argmax(axis=2)
-                print(pred_semantic.unique())
                 pred_semantic = (pred_semantic * 255).astype(np.uint8)
 
 
@@ -872,6 +931,7 @@ class Trainer(object):
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 preds, truths, loss, semantic_preds, semantic_truths, semantic_loss = self.train_step(data)
 
+
             # print("lambda_s:", self.lambda_s)
             combined_loss = loss + self.lambda_s * semantic_loss
 
@@ -882,10 +942,16 @@ class Trainer(object):
             if self.scheduler_update_every_step:
                 self.lr_scheduler.step()
 
-            loss_val = loss.item()
-            total_loss += loss_val
+            if self.opt.only_seg:
+                loss_val = 0
+            else:
+                loss_val = loss.item()
+                total_loss += loss_val
 
-            semantic_loss_val = semantic_loss.item()
+            if not self.no_seg:
+                semantic_loss_val = semantic_loss.item()
+            else:
+                semantic_loss_val = 0
             total_semantic_loss += semantic_loss_val
 
             if self.local_rank == 0:
@@ -987,7 +1053,10 @@ class Trainer(object):
                 loss_val = loss.item()
                 total_loss += loss_val
 
-                semantic_loss_val = semantic_loss.item()
+                if not self.no_seg:
+                    semantic_loss_val = semantic_loss.item()
+                else:
+                    semantic_loss_val = 0
                 total_semantic_loss += semantic_loss_val
 
                 # only rank = 0 will perform evaluation.
@@ -1014,25 +1083,43 @@ class Trainer(object):
                     pred_depth = preds_depth[0].detach().cpu().numpy()
                     pred_depth = (pred_depth * 255).astype(np.uint8)
 
-                    # pred_semantic = logits_2_label(preds_semantic[0]).detach().cpu().numpy()
-                    pred_semantic = preds_semantic[0].detach().cpu().numpy().argmax(axis=2)
-                    pred_semantic_num_classes = pred_semantic
-                    colour_map_np = nyu40_colour_code
-                    pred_semantic = colour_map_np[pred_semantic]
+                    if not self.no_seg:
+                        # pred_semantic = logits_2_label(preds_semantic[0]).detach().cpu().numpy()
+                        pred_semantic = preds_semantic[0].detach().cpu().numpy().argmax(axis=2)
+                        pred_semantic_num_classes = pred_semantic
+                        colour_map_np = nyu40_colour_code
+                        pred_semantic = colour_map_np[pred_semantic]
 
-                    semantic_gt = colour_map_np[semantic_truths[0].cpu().numpy().squeeze()]
-                    semantic_gt_num_classes = semantic_truths[0].cpu().numpy().squeeze()
+                        if self.opt.use_class_vector:
+                            semantic_gt = colour_map_np[semantic_truths[0].cpu().numpy().argmax(axis=2)]
+                            semantic_gt_num_classes = semantic_truths[0].cpu().numpy().argmax(axis=2)
+                        else:
+                            semantic_gt = colour_map_np[semantic_truths[0].cpu().numpy().squeeze()]
+                            semantic_gt_num_classes = semantic_truths[0].cpu().numpy().squeeze()
 
+                    # Claculate Entropy and print it
+                    if self.opt.entropy:
+                        entropy = -(torch.sum(semantic_truths[0] * torch.log(semantic_truths[0]), axis=2)).cpu().numpy().squeeze()
+                        print(entropy.shape)
+                        print(entropy.max())
+                        print(entropy.min())
+                        # save_path_entropy = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_entropy.png')
+                        # cv2.imwrite(save_path_entropy, entropy)
 
                     if self.save_images:
                         cv2.imwrite(save_path, cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
                         cv2.imwrite(save_path_depth, pred_depth)
-                        cv2.imwrite(save_path_semantics, pred_semantic)
-                        cv2.imwrite(save_path_semantics_gt, semantic_gt)
+                        if not self.no_seg:
+                            cv2.imwrite(save_path_semantics, pred_semantic)
+                            cv2.imwrite(save_path_semantics_gt, semantic_gt)
+                            cv2.imwrite(save_path_semantics_gt, semantic_gt)
 
                     # Calculate segmentation scores
-                    miou_test, miou_test_validclass, total_accuracy_test, class_average_accuracy_test, ious_test = \
-                    calculate_segmentation_metrics(true_labels=semantic_gt_num_classes, predicted_labels=pred_semantic_num_classes, number_classes=self.num_classes, ignore_label=0)
+                    if not self.no_seg:
+                        miou_test, miou_test_validclass, total_accuracy_test, class_average_accuracy_test, ious_test = \
+                        calculate_segmentation_metrics(true_labels=semantic_gt_num_classes, predicted_labels=pred_semantic_num_classes, number_classes=self.num_classes, ignore_label=None)
+                    else:
+                        miou_test, miou_test_validclass, total_accuracy_test, class_average_accuracy_test, ious_test = 0, 0, 0, 0, 0
 
                     self.miou += miou_test
                     self.total_accuracy += total_accuracy_test
@@ -1093,7 +1180,7 @@ class Trainer(object):
             state['scaler'] = self.scaler.state_dict()
             if self.ema is not None:
                 state['ema'] = self.ema.state_dict()
-        
+
         if not best:
 
             state['model'] = self.model.state_dict()
@@ -1110,13 +1197,13 @@ class Trainer(object):
 
             torch.save(state, file_path)
 
-        else:    
+        else:
             if len(self.stats["results"]) > 0:
                 if self.stats["best_result"] is None or self.stats["results"][-1] < self.stats["best_result"]:
                     self.log(f"[INFO] New best result: {self.stats['best_result']} --> {self.stats['results'][-1]}")
                     self.stats["best_result"] = self.stats["results"][-1]
 
-                    # save ema results 
+                    # save ema results
                     if self.ema is not None:
                         self.ema.store()
                         self.ema.copy_to()
@@ -1129,11 +1216,11 @@ class Trainer(object):
 
                     if self.ema is not None:
                         self.ema.restore()
-                    
+
                     torch.save(state, self.best_path)
             else:
                 self.log(f"[WARN] no evaluated results found, skip saving best checkpoint.")
-            
+
     def load_checkpoint(self, checkpoint=None, model_only=False):
         if checkpoint is None:
             checkpoint_list = sorted(glob.glob(f'{self.ckpt_path}/{self.name}_ep*.pth'))
@@ -1145,7 +1232,7 @@ class Trainer(object):
                 return
 
         checkpoint_dict = torch.load(checkpoint, map_location=self.device)
-        
+
         if 'model' not in checkpoint_dict:
             self.model.load_state_dict(checkpoint_dict)
             self.log("[INFO] loaded model.")
@@ -1156,7 +1243,7 @@ class Trainer(object):
         if len(missing_keys) > 0:
             self.log(f"[WARN] missing keys: {missing_keys}")
         if len(unexpected_keys) > 0:
-            self.log(f"[WARN] unexpected keys: {unexpected_keys}")   
+            self.log(f"[WARN] unexpected keys: {unexpected_keys}")
 
         if self.ema is not None and 'ema' in checkpoint_dict:
             self.ema.load_state_dict(checkpoint_dict['ema'])
@@ -1166,7 +1253,7 @@ class Trainer(object):
                 self.model.mean_count = checkpoint_dict['mean_count']
             if 'mean_density' in checkpoint_dict:
                 self.model.mean_density = checkpoint_dict['mean_density']
-        
+
         if model_only:
             return
 
@@ -1174,28 +1261,27 @@ class Trainer(object):
         self.epoch = checkpoint_dict['epoch']
         self.global_step = checkpoint_dict['global_step']
         self.log(f"[INFO] load at epoch {self.epoch}, global step {self.global_step}")
-        
+
         if self.optimizer and 'optimizer' in checkpoint_dict:
             try:
                 self.optimizer.load_state_dict(checkpoint_dict['optimizer'])
                 self.log("[INFO] loaded optimizer.")
             except:
                 self.log("[WARN] Failed to load optimizer.")
-        
+
         if self.lr_scheduler and 'lr_scheduler' in checkpoint_dict:
             try:
                 self.lr_scheduler.load_state_dict(checkpoint_dict['lr_scheduler'])
                 self.log("[INFO] loaded scheduler.")
             except:
                 self.log("[WARN] Failed to load scheduler.")
-        
+
         if self.scaler and 'scaler' in checkpoint_dict:
             try:
                 self.scaler.load_state_dict(checkpoint_dict['scaler'])
                 self.log("[INFO] loaded scaler.")
             except:
                 self.log("[WARN] Failed to load scaler.")
-
 
 def nanmean(data, **args):
     # This makes it ignore the first 'background' class
