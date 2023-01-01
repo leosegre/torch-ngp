@@ -165,7 +165,7 @@ class NeRFDataset:
         else:
             # we have to actually read an image to get H and W later.
             self.H = self.W = None
-        
+
         # read images
         frames = transform["frames"]
         #frames = sorted(frames, key=lambda d: d['file_path']) # why do I sort...
@@ -201,6 +201,9 @@ class NeRFDataset:
             self.poses = []
             self.images = []
             self.semantics = []
+            self.original_name = []
+
+
             for f in tqdm.tqdm(frames, desc=f'Loading {type} data'):
                 f_path = os.path.join(self.root_path, f['file_path'])
                 s_path = os.path.join(self.root_path, f['semantic_path'])
@@ -218,8 +221,9 @@ class NeRFDataset:
                     continue
 
                 pose = np.array(f['transform_matrix'], dtype=np.float32) # [4, 4]
-                if not self.opt.generate:
-                    pose = nerf_matrix_to_ngp(pose, scale=self.scale, offset=self.offset)
+                # if not self.opt.generate:
+                pose = nerf_matrix_to_ngp(pose, scale=self.scale, offset=self.offset)
+
 
                 if self.opt.generate:
                     image = np.zeros((256, 256, 3), np.uint8)
@@ -242,6 +246,8 @@ class NeRFDataset:
                     else:
                         semantic = cv2.imread(s_path, cv2.IMREAD_GRAYSCALE) # [H, W]
                         semantic = np.expand_dims(semantic, axis=2) # [H, W, 1]
+                    if self.opt.use_class_vector:
+                        semantic = torch.from_numpy(semantic).to(dtype=torch.float16)
                     if self.H is None or self.W is None:
                         self.H = image.shape[0] // downscale
                         self.W = image.shape[1] // downscale
@@ -261,14 +267,25 @@ class NeRFDataset:
                 self.poses.append(pose)
                 self.images.append(image)
                 self.semantics.append(semantic)
+                if self.opt.generate:
+                    self.original_name.append(f['file_path'])
+
 
         self.poses = torch.from_numpy(np.stack(self.poses, axis=0)) # [N, 4, 4]
         if self.images is not None:
             self.images = torch.from_numpy(np.stack(self.images, axis=0)) # [N, H, W, C]
         if self.semantics is not None:
-            self.semantics = torch.from_numpy(np.stack(self.semantics, axis=0)) # [N, H, W, 1]
+            if self.use_class_vector:
+                self.semantics = torch.stack(self.semantics, axis=0) # [N, H, W, 1]
+            else:
+                self.semantics = torch.from_numpy(np.stack(self.semantics, axis=0)) # [N, H, W, 1]
+        if self.opt.generate:
+            self.original_name = np.stack(self.original_name, axis=0) # [N, 1]
 
         # Calculate number of semantic classes
+        # if self.opt.use_class_vector:
+        #     self.semantic_classes = torch.unique(self.semantics)
+        # else:
         self.semantic_classes = np.unique(self.semantics)
         self.num_semantic_class = self.semantic_classes.shape[0]  # number of semantic classes, including the void class of 0
         print("num_semantic_class:", self.num_semantic_class)
@@ -388,6 +405,9 @@ class NeRFDataset:
         if error_map is not None:
             results['index'] = index
             results['inds_coarse'] = rays['inds_coarse']
+
+        if self.opt.generate:
+            results['original_name'] = self.original_name[index]
             
         return results
 

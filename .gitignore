@@ -14,3 +14,5 @@ tensorf/
 **tensorf*
 
 tests/
+runs/
+work_dirs/

@@ -1066,10 +1066,14 @@ class Trainer(object):
                         metric.update(preds, truths)
 
                     # save image
-                    save_path = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_rgb.png')
-                    save_path_semantics = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_semantics.png')
-                    save_path_depth = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_depth.png')
-                    save_path_semantics_gt = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_semantics_gt.png')
+                    if self.opt.generate:
+                        # print(data['original_name'])
+                        save_path = os.path.join(self.workspace, 'validation', data['original_name'][0])
+                    else:
+                        save_path = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_rgb.png')
+                        save_path_semantics = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_semantics.png')
+                        save_path_depth = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_depth.png')
+                        save_path_semantics_gt = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_semantics_gt.png')
 
                     #self.log(f"==> Saving validation image to {save_path}")
                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -1108,11 +1112,12 @@ class Trainer(object):
 
                     if self.save_images:
                         cv2.imwrite(save_path, cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
-                        cv2.imwrite(save_path_depth, pred_depth)
-                        if not self.no_seg:
-                            cv2.imwrite(save_path_semantics, pred_semantic)
-                            cv2.imwrite(save_path_semantics_gt, semantic_gt)
-                            cv2.imwrite(save_path_semantics_gt, semantic_gt)
+                        if not self.opt.generate:
+                            cv2.imwrite(save_path_depth, pred_depth)
+                            if not self.no_seg:
+                                cv2.imwrite(save_path_semantics, pred_semantic)
+                                cv2.imwrite(save_path_semantics_gt, semantic_gt)
+                                cv2.imwrite(save_path_semantics_gt, semantic_gt)
 
                     # Calculate segmentation scores
                     if not self.no_seg:

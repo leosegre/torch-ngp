@@ -95,6 +95,17 @@ def get_transform_matrix_by_radius(r, theta, phi):
     return nerf_matrix_to_ngp(transform_matrix)
 
 
+def ngp_matrix_to_nerf(pose, scale=1, offset=[0, 0, 0]):
+    # reverse the operations in nerf_matrix_to_ngp to get the original matrix
+    new_pose = np.array([
+        [pose[1, 0], pose[2, 0], pose[0, 0], -pose[0, 3] / scale - offset[0]],
+        [-pose[1, 1], -pose[2, 1], -pose[0, 1], pose[1, 3] / scale + offset[1]],
+        [-pose[1, 2], -pose[2, 2], -pose[0, 2], pose[2, 3] / scale + offset[2]],
+        [0, 0, 0, 1],
+    ], dtype=np.float32)
+    return new_pose
+
+
 def rand_poses(size, device, radius=1, theta_range=[0, 4 * (np.pi / 9)], phi_range=[0, 2 * np.pi]):
     ''' generate random poses from an orbit camera
     Args:
@@ -155,12 +166,12 @@ def add_frames(frames, num_frames=3000, radius=2):
         frame['file_path'] = "Images/"+str(curr_frame_num).zfill(5)+".png"
         frame['semantic_path'] = "Labels/"+str(curr_frame_num).zfill(5)+".png"
         frame['sharpness'] = "0"
-        frame['transform_matrix'] = (new_matrices[i]).tolist()
-        new_frames.append(frame)
+        frame['transform_matrix'] = (ngp_matrix_to_nerf(new_matrices[i])).tolist()
+        frames.append(frame)
         curr_frame_num += 1
 
 
-    return new_frames
+    return new_frames + frames
 
 
 def main(file_name):
