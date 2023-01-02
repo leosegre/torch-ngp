@@ -66,6 +66,7 @@ class NeRFRenderer(nn.Module):
                  min_near=0.2,
                  density_thresh=0.01,
                  bg_radius=-1,
+                 instance_loss = False,
                  ):
         super().__init__()
 
@@ -76,6 +77,7 @@ class NeRFRenderer(nn.Module):
         self.min_near = min_near
         self.density_thresh = density_thresh
         self.bg_radius = bg_radius # radius of the background sphere.
+        self.instance_loss = instance_loss
 
         # prepare aabb with a 6D tensor (xmin, ymin, zmin, xmax, ymax, zmax)
         # NOTE: aabb (can be rectangular) is only used to generate points, we still rely on bound (always cubic) to calculate density grid and hashing.
@@ -300,14 +302,59 @@ class NeRFRenderer(nn.Module):
 
             #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
 
-            print(xyzs.shape)
-            
             sigmas, rgbs, semantics = self(xyzs, dirs)
+
+
             # density_outputs = self.density(xyzs) # [M,], use a dict since it may include extra things, like geo_feat for rgb.
             # sigmas = density_outputs['sigma']
             # rgbs = self.color(xyzs, dirs, **density_outputs)
             sigmas = self.density_scale * sigmas
             # print("rgbs:", rgbs.shape)
+
+            if self.instance_loss:
+                # r = 2.5e-6
+                r = (((xyzs[:-1] - xyzs[1:])**2).sum(axis=1)).max().item()
+
+                theta_rad = torch.pi * torch.rand(xyzs.shape[0], device=device)
+                phi_rad = 2 * torch.pi * torch.rand(xyzs.shape[0], device=device)
+
+                x = r * torch.sin(theta_rad) * torch.cos(phi_rad)
+                y = r * torch.sin(theta_rad) * torch.sin(phi_rad)
+                z = r * torch.cos(theta_rad)
+
+                xyzs_plus_delta = xyzs.clone()
+                xyzs_plus_delta[:, 0] += x
+                xyzs_plus_delta[:, 1] += y
+                xyzs_plus_delta[:, 2] += z
+                # xyzs_plus_delta_y = xyzs.clone()
+                # xyzs_plus_delta_y[:, 1] += delta_xyz
+                # xyzs_plus_delta_z = xyzs.clone()
+                # xyzs_plus_delta_z[:, 2] += delta_xyz
+                # print(((xyzs[:-1] - xyzs[1:])**2).sum(axis=1))
+
+
+                # xyzs_plus_delta = xyzs.repeat(3, 1, 1)
+                # xyzs_plus_delta[0, :, 0] += delta_xyz
+                # xyzs_plus_delta[1, :, 1] += delta_xyz
+                # xyzs_plus_delta[2, :, 2] += delta_xyz
+
+                sigmas_plus_delta, _, semantics_plus_delta = self(xyzs_plus_delta, dirs)
+                sigmas_plus_delta = sigmas_plus_delta * self.density_scale
+                # sigmas_plus_delta_y, _, semantics_plus_delta_y = self(xyzs_plus_delta_y, dirs)
+                # sigmas_plus_delta_y = sigmas_plus_delta_y * self.density_scale
+                # sigmas_plus_delta_z, _, semantics_plus_delta_z = self(xyzs_plus_delta_z, dirs)
+                # sigmas_plus_delta_z = sigmas_plus_delta_z * self.density_scale
+
+                kl_loss = torch.nn.KLDivLoss(reduction='none', log_target=False)
+
+                instance_loss_calc = kl_loss(F.log_softmax(semantics.unsqueeze(0), -1), semantics_plus_delta.detach().unsqueeze(0)).mean(-1)
+                instance_loss_calc = 0.001 * sigmas * sigmas_plus_delta.detach() * instance_loss_calc
+
+                # instance_loss_calc_y = sigmas_plus_delta_y * sigmas * kl_loss(semantics_plus_delta_y, semantics).mean(-1)
+                # instance_loss_calc_z = sigmas_plus_delta_z * sigmas * kl_loss(semantics_plus_delta_z, semantics).mean(-1)
+                # instance_loss_calc = instance_loss_calc_x + instance_loss_calc_y + instance_loss_calc_z
+                # instance_loss_calc = instance_loss_calc[sigmas>0.5]
+
 
             #print(f'valid RGB query ratio: {mask.sum().item() / mask.shape[0]} (total = {mask.sum().item()})')
 
@@ -408,7 +455,8 @@ class NeRFRenderer(nn.Module):
         results['depth'] = depth
         results['image'] = image
         results['semantic_image'] = semantic_image
-
+        if self.instance_loss:
+            results['instance_loss_clac'] = instance_loss_calc
         return results
 
     @torch.no_grad()

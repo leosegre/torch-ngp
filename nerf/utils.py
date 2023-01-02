@@ -511,7 +511,7 @@ class Trainer(object):
                 gt_semantic_label_confidence = gt_semantic.squeeze().max(axis=1)[0]
                 confidence_threshold = 0.99
                 confidence_mask = gt_semantic_label_confidence >= confidence_threshold
-                gt_semantic_softmax = gt_semantic.squeeze().log_softmax(dim=1, dtype=torch.float32)
+                gt_semantic_softmax = gt_semantic.squeeze().softmax(dim=1, dtype=torch.float32)
                 # print()
                 # print(" gt_semantic.squeeze().sum(axis=1):", gt_semantic.squeeze().sum(axis=1))
                 # print("gt_semantic_softmax:", gt_semantic_softmax[0])
@@ -519,12 +519,18 @@ class Trainer(object):
                 # semantic_loss = (self.semantic_criterion(pred_semantic.squeeze(), gt_semantic_label) * confidence_mask).mean(-1) # [B, N, 92] --> [B, N]
                 # print("pred_semantic", pred_semantic.dtype)
                 # print("gt_semantic_softmax", gt_semantic_softmax.dtype)
-                semantic_loss = (self.semantic_criterion(pred_semantic.squeeze(), gt_semantic_softmax)).mean(-1) # [B, N, 92] --> [B, N]
+                # print("pred_semantic", pred_semantic.shape)
+                # print("gt_semantic_softmax", gt_semantic_softmax.shape)
+                semantic_loss = (self.semantic_criterion(F.log_softmax(pred_semantic, -1), gt_semantic_softmax.unsqueeze(0))).mean(-1) # [B, N, 92] --> [B, N]
             else:
                 # print("pred_semantic:", pred_semantic.shape)
                 # print("gt_semantic:", gt_semantic.shape)
                 semantic_loss = self.semantic_criterion(pred_semantic.squeeze(), gt_semantic.squeeze()).mean(-1) # [B, N, 92] --> [B, N]
 
+        if self.opt.instance_loss:
+            instance_loss = outputs['instance_loss_clac'].mean()
+        else:
+            instance_loss = 0
 
         # patch-based rendering
         if self.opt.patch_size > 1:
@@ -580,7 +586,7 @@ class Trainer(object):
         # loss_ws = - 1e-1 * pred_weights_sum * torch.log(pred_weights_sum) # entropy to encourage weights_sum to be 0 or 1.
         # loss = loss + loss_ws.mean()
 
-        return pred_rgb, gt_rgb, loss, pred_semantic, gt_semantic, semantic_loss
+        return pred_rgb, gt_rgb, loss, pred_semantic, gt_semantic, semantic_loss, instance_loss
 
     def eval_step(self, data):
 
@@ -900,6 +906,7 @@ class Trainer(object):
 
         total_loss = 0
         total_semantic_loss = 0
+        total_instance_loss = 0
         if self.local_rank == 0 and self.report_metric_at_train:
             for metric in self.metrics:
                 metric.clear()
@@ -929,11 +936,14 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss, semantic_preds, semantic_truths, semantic_loss = self.train_step(data)
+                preds, truths, loss, semantic_preds, semantic_truths, semantic_loss, instance_loss = self.train_step(data)
 
 
             # print("lambda_s:", self.lambda_s)
-            combined_loss = loss + self.lambda_s * semantic_loss
+            # print("loss:", loss.shape)
+            # print("semantic_loss:", semantic_loss.shape)
+            # print("instance_loss", instance_loss.shape)
+            combined_loss = loss + self.lambda_s * semantic_loss + instance_loss
 
             self.scaler.scale(combined_loss).backward()
             self.scaler.step(self.optimizer)
@@ -941,6 +951,12 @@ class Trainer(object):
 
             if self.scheduler_update_every_step:
                 self.lr_scheduler.step()
+
+            if self.opt.instance_loss:
+                instance_loss_val = instance_loss.item()
+            else:
+                instance_loss_val = 0
+            total_instance_loss += instance_loss_val
 
             if self.opt.only_seg:
                 loss_val = 0
@@ -962,10 +978,12 @@ class Trainer(object):
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/loss", loss_val, self.global_step)
                     self.writer.add_scalar("train/semantic_loss", semantic_loss_val, self.global_step)
+                    self.writer.add_scalar("train/instance_loss", instance_loss_val, self.global_step)
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
 
                 if self.scheduler_update_every_step:
-                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), semantic_loss={semantic_loss_val:.4f} ({total_semantic_loss/self.local_step:.4f}),lr={self.optimizer.param_groups[0]['lr']:.6f}")
+                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), semantic_loss={semantic_loss_val:.4f} ({total_semantic_loss/self.local_step:.4f})"
+                                         f", instance_loss={instance_loss_val:.4f} ({total_instance_loss/self.local_step:.4f}),lr={self.optimizer.param_groups[0]['lr']:.6f}")
                 else:
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
                 pbar.update(loader.batch_size)

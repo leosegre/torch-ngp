@@ -70,6 +70,7 @@ if __name__ == '__main__':
     parser.add_argument('--no_seg', action='store_true', help="Do not optimize semantics")
     parser.add_argument('--only_seg', action='store_true', help="Optimize semantics only")
     parser.add_argument('--entropy', action='store_true', help="Calculate entropy")
+    parser.add_argument('--instance_loss', action='store_true', help="Use instance loss")
 
     ### Generate more data
     parser.add_argument('--generate', action='store_true', help="Generate more data, the original images does not exist")
@@ -116,6 +117,7 @@ if __name__ == '__main__':
             num_classes=opt.num_classes,
             no_seg=opt.no_seg,
             only_seg=opt.only_seg,
+            instance_loss=opt.instance_loss,
         )
     else:
         model = NeRFNetwork(
@@ -143,7 +145,7 @@ if __name__ == '__main__':
     criterion = torch.nn.MSELoss(reduction='none')
     # semantic_criterion = torch.nn.CrossEntropyLoss(reduction='none')
     if opt.use_class_vector:
-        semantic_criterion = torch.nn.KLDivLoss(reduction='none', log_target=True)
+        semantic_criterion = torch.nn.KLDivLoss(reduction='none', log_target=False)
     else:
         semantic_criterion = torch.nn.NLLLoss(reduction='none')
     #criterion = partial(huber_loss, reduction='none')

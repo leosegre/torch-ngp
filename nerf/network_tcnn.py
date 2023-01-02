@@ -18,12 +18,13 @@ class NeRFNetwork(NeRFRenderer):
                  geo_feat_dim=15,
                  num_layers_color=3,
                  hidden_dim_color=64,
-                 num_layers_semantic=6,
+                 num_layers_semantic=3,
                  hidden_dim_semantic=128,
                  bound=1,
                  num_classes=92,
                  no_seg=False,
                  only_seg=False,
+                 n_bins=4,
                  **kwargs
                  ):
         super().__init__(bound, **kwargs)
@@ -37,6 +38,7 @@ class NeRFNetwork(NeRFRenderer):
         self.hidden_dim = hidden_dim
         self.geo_feat_dim = geo_feat_dim
         self.num_classes = num_classes
+        self.n_bins = n_bins
 
         per_level_scale = np.exp2(np.log2(2048 * bound / 16) / (16 - 1))
 
@@ -102,7 +104,17 @@ class NeRFNetwork(NeRFRenderer):
             },
         )
 
-    def forward(self, x, d):
+        # Semantics encoding
+        self.encoder_semantics = tcnn.Encoding(
+            n_input_dims=self.num_classes,
+            encoding_config={
+                "otype": "oneblob",
+                "n_bins": self.n_bins,
+            },
+        )
+
+
+    def forward(self, x, d, s):
         # x: [N, 3], in [-bound, bound]
         # d: [N, 3], nomalized in [-1, 1]
 
@@ -115,11 +127,14 @@ class NeRFNetwork(NeRFRenderer):
         sigma = trunc_exp(h[..., 0])
         geo_feat = h[..., 1:]
 
+        # semantics encoding
+
         # semantics
         semantic = self.semantic_net(geo_feat)
         # Softmax for semantic segmentation
-        semantic = torch.log_softmax(semantic, dim=1)
-        # semantic = torch.softmax(semantic, dim=1)
+        # semantic = torch.log_softmax(semantic, dim=1)
+        # semantic = torch.nn.functional.log_softmax(semantic, dim=1)
+        semantic = torch.softmax(semantic, dim=1)
 
         # color
         d = (d + 1) / 2  # tcnn SH encoding requires inputs to be in [0, 1]
@@ -131,6 +146,8 @@ class NeRFNetwork(NeRFRenderer):
 
         # sigmoid activation for rgb
         color = torch.sigmoid(h)
+
+        # print(semantic.sum(axis=1))
 
         return sigma, color, semantic
 
@@ -174,7 +191,7 @@ class NeRFNetwork(NeRFRenderer):
         # print(torch.topk(s, 2))
 
         # Softmax for semantic segmentation
-        semantic = torch.log_softmax(semantic, dim=1)
+        semantic = torch.log_softmax(s, dim=1)
         # semantic = torch.softmax(semantic, dim=1)
         # if(semantic.max())
         # print(semantic.max())
