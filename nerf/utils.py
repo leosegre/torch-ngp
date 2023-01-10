@@ -33,6 +33,8 @@ import lpips
 
 from sklearn.metrics import confusion_matrix
 
+import scipy
+
 
 def custom_meshgrid(*args):
     # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
@@ -453,7 +455,7 @@ class Trainer(object):
             H, W = data['H'], data['W']
 
             # currently fix white bg, MUST force all rays!
-            outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=None, perturb=True, force_all_rays=True, **vars(self.opt))
+            outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=None, perturb=True, force_all_rays=True, opt=self.opt)
             pred_rgb = outputs['image'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
 
             # [debug] uncomment to plot the images used in train_step
@@ -464,6 +466,8 @@ class Trainer(object):
             return pred_rgb, None, loss
 
         images = data['images'] # [B, N, 3/4]
+        if self.opt.dist_load:
+            dist_images = data['dist_images'] / 255 # [B, N, 3/4]
         semantic_images = data['semantics'] # [B, N, 1]
 
         B, N, C = images.shape
@@ -487,8 +491,9 @@ class Trainer(object):
 
         gt_semantic = semantic_images
 
+
         # outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
-        outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, opt=self.opt)
 
         pred_rgb = outputs['image']
 
@@ -527,10 +532,19 @@ class Trainer(object):
                 # print("gt_semantic:", gt_semantic.shape)
                 semantic_loss = self.semantic_criterion(pred_semantic.squeeze(), gt_semantic.squeeze()).mean(-1) # [B, N, 92] --> [B, N]
 
+            # Dist from middle of shape
+            if self.opt.dist_load:
+                dist_thresh = 0.1
+                # print("dist_images", dist_images.shape)
+                # print("semantic_loss", semantic_loss.shape)
+                semantic_loss = semantic_loss[dist_images.squeeze(-1) >= dist_thresh]
+
+
         if self.opt.instance_loss:
             instance_loss = outputs['instance_loss_clac'].mean()
         else:
             instance_loss = 0
+
 
         # patch-based rendering
         if self.opt.patch_size > 1:
@@ -608,10 +622,24 @@ class Trainer(object):
         else:
             gt_rgb = images
 
+        if self.opt.generate_dist:
+            s_img = semantic_images[0]
+            dist_from_other_classes = np.zeros_like(s_img.cpu().numpy(), dtype='float64')
+            for class_idx in range(self.num_classes):
+                img_class_idx = (s_img == class_idx).cpu().numpy().astype(int)
+                dist = scipy.ndimage.morphology.distance_transform_edt(img_class_idx)
+                if dist.max():
+                    dist = dist / dist.max()
+                dist_from_other_classes += dist*255
+
+            # save_path = os.path.join(self.workspace, 'validation',
+            #                          f'{self.local_step:04d}_dist.png')
+            save_path = os.path.join(self.workspace, 'validation', data['original_name'][0])
+            cv2.imwrite(save_path, dist_from_other_classes)
 
         gt_semantic = semantic_images
 
-        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, opt=self.opt)
 
         pred_rgb = outputs['image'].reshape(B, H, W, 3)
         pred_depth = outputs['depth'].reshape(B, H, W)
@@ -655,7 +683,7 @@ class Trainer(object):
         if bg_color is not None:
             bg_color = bg_color.to(self.device)
 
-        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb, opt=self.opt)
 
         pred_rgb = outputs['image'].reshape(-1, H, W, 3)
         pred_depth = outputs['depth'].reshape(-1, H, W)
@@ -924,7 +952,7 @@ class Trainer(object):
         self.local_step = 0
 
         for data in loader:
-            
+
             # update grid every 16 steps
             if self.model.cuda_ray and self.global_step % self.opt.update_extra_interval == 0:
                 with torch.cuda.amp.autocast(enabled=self.fp16):
@@ -937,6 +965,7 @@ class Trainer(object):
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 preds, truths, loss, semantic_preds, semantic_truths, semantic_loss, instance_loss = self.train_step(data)
+
 
 
             # print("lambda_s:", self.lambda_s)
@@ -1325,7 +1354,7 @@ def calculate_segmentation_metrics(true_labels, predicted_labels, number_classes
     conf_mat = confusion_matrix(true_labels, predicted_labels, labels=list(range(number_classes)))
     with np.errstate(divide='ignore',invalid='ignore'): # divide by 0, handled by missing_class_mask
         norm_conf_mat = np.transpose(
-            np.transpose(conf_mat) / conf_mat.astype(np.float).sum(axis=1))
+            np.transpose(conf_mat) / conf_mat.astype(np.float32).sum(axis=1))
 
     missing_class_mask = np.isnan(norm_conf_mat.sum(1))  # missing class will have NaN at corresponding class
     exsiting_class_mask = ~ missing_class_mask

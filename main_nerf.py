@@ -71,9 +71,12 @@ if __name__ == '__main__':
     parser.add_argument('--only_seg', action='store_true', help="Optimize semantics only")
     parser.add_argument('--entropy', action='store_true', help="Calculate entropy")
     parser.add_argument('--instance_loss', action='store_true', help="Use instance loss")
+    parser.add_argument('--dist_load', action='store_true', help="Use distance from middle of shape")
 
     ### Generate more data
     parser.add_argument('--generate', action='store_true', help="Generate more data, the original images does not exist")
+    parser.add_argument('--generate_dist', action='store_true', help="Generate distance map")
+    parser.add_argument('--save_mesh', action='store_true', help="Save mesh")
 
 
 
@@ -139,6 +142,7 @@ if __name__ == '__main__':
         for param in model.semantic_net.parameters():
             param.requires_grad = False
 
+
     
     print(model)
 
@@ -172,13 +176,15 @@ if __name__ == '__main__':
         else:
             test_loader = NeRFDataset(opt, device=device, type='test').dataloader()
 
+            if opt.save_mesh:
+                trainer.save_mesh(resolution=256, threshold=1000)
+
             if test_loader.has_gt:
                 trainer.evaluate(test_loader) # blender has gt, so evaluate it.
 
             # trainer.test(test_loader, write_video=True) # test and save video
             
-            # trainer.save_mesh(resolution=256, threshold=10)
-    
+
     else:
 
         optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)

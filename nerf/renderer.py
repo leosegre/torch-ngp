@@ -66,7 +66,7 @@ class NeRFRenderer(nn.Module):
                  min_near=0.2,
                  density_thresh=0.01,
                  bg_radius=-1,
-                 instance_loss = False,
+                 instance_loss=False,
                  ):
         super().__init__()
 
@@ -267,7 +267,7 @@ class NeRFRenderer(nn.Module):
         }
 
 
-    def run_cuda(self, rays_o, rays_d, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=False, max_steps=1024, T_thresh=1e-4, **kwargs):
+    def run_cuda(self, rays_o, rays_d, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=False, max_steps=1024, T_thresh=1e-4, opt=None):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
         # return: image: [B, N, 3], depth: [B, N]
 
@@ -313,6 +313,7 @@ class NeRFRenderer(nn.Module):
 
             if self.instance_loss:
                 # r = 2.5e-6
+                # r = 2.5e-2
                 r = (((xyzs[:-1] - xyzs[1:])**2).sum(axis=1)).max().item()
 
                 theta_rad = torch.pi * torch.rand(xyzs.shape[0], device=device)
@@ -322,7 +323,7 @@ class NeRFRenderer(nn.Module):
                 y = r * torch.sin(theta_rad) * torch.sin(phi_rad)
                 z = r * torch.cos(theta_rad)
 
-                xyzs_plus_delta = xyzs.clone()
+                xyzs_plus_delta = xyzs.detach().clone()
                 xyzs_plus_delta[:, 0] += x
                 xyzs_plus_delta[:, 1] += y
                 xyzs_plus_delta[:, 2] += z
@@ -345,10 +346,28 @@ class NeRFRenderer(nn.Module):
                 # sigmas_plus_delta_z, _, semantics_plus_delta_z = self(xyzs_plus_delta_z, dirs)
                 # sigmas_plus_delta_z = sigmas_plus_delta_z * self.density_scale
 
-                kl_loss = torch.nn.KLDivLoss(reduction='none', log_target=False)
+                kl_loss = torch.nn.KLDivLoss(reduction='none', log_target=True)
+                nll_loss = torch.nn.NLLLoss(reduction='none')
+                l2_loss = torch.nn.MSELoss(reduction='none')
 
-                instance_loss_calc = kl_loss(F.log_softmax(semantics.unsqueeze(0), -1), semantics_plus_delta.detach().unsqueeze(0)).mean(-1)
-                instance_loss_calc = 0.001 * sigmas * sigmas_plus_delta.detach() * instance_loss_calc
+                # mask_thresh = opt.density_thresh * 10
+
+                # instance_loss_mask = (sigmas.detach() >= mask_thresh) & (sigmas_plus_delta.detach() >= mask_thresh)
+                # print(instance_loss_mask.shape)
+                # if torch.any(instance_loss_mask):
+                    # instance_loss_calc = kl_loss(F.log_softmax(semantics[instance_loss_mask].unsqueeze(0), -1), semantics_plus_delta[instance_loss_mask].detach().unsqueeze(0)).mean(-1)
+                instance_loss_calc = kl_loss(F.log_softmax(semantics, -1), F.log_softmax(semantics_plus_delta, -1)).mean(-1)
+                    # print()
+                    # print("semantics", semantics[instance_loss_mask].unsqueeze(0))
+                    # print("semantics_plus_delta", semantics_plus_delta[instance_loss_mask].detach().unsqueeze(0))
+                    # print(instance_loss_calc.min())
+                # else:
+                #     instance_loss_calc = torch.zeros(1)
+                instance_loss_calc = 0.001 * sigmas.detach() * sigmas_plus_delta.detach() * instance_loss_calc
+
+                # instance_loss_calc = 0.01 * torch.sigmoid(sigmas).detach() * torch.sigmoid(sigmas_plus_delta).detach() * instance_loss_calc
+
+
 
                 # instance_loss_calc_y = sigmas_plus_delta_y * sigmas * kl_loss(semantics_plus_delta_y, semantics).mean(-1)
                 # instance_loss_calc_z = sigmas_plus_delta_z * sigmas * kl_loss(semantics_plus_delta_z, semantics).mean(-1)

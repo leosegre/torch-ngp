@@ -18,13 +18,13 @@ class NeRFNetwork(NeRFRenderer):
                  geo_feat_dim=15,
                  num_layers_color=3,
                  hidden_dim_color=64,
+                 semantic_feat_dim=15,
                  num_layers_semantic=3,
-                 hidden_dim_semantic=128,
+                 hidden_dim_semantic=64,
                  bound=1,
                  num_classes=92,
                  no_seg=False,
                  only_seg=False,
-                 n_bins=4,
                  **kwargs
                  ):
         super().__init__(bound, **kwargs)
@@ -37,8 +37,8 @@ class NeRFNetwork(NeRFRenderer):
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
         self.geo_feat_dim = geo_feat_dim
+        self.semantic_feat_dim = semantic_feat_dim
         self.num_classes = num_classes
-        self.n_bins = n_bins
 
         per_level_scale = np.exp2(np.log2(2048 * bound / 16) / (16 - 1))
 
@@ -56,7 +56,7 @@ class NeRFNetwork(NeRFRenderer):
 
         self.sigma_net = tcnn.Network(
             n_input_dims=32,
-            n_output_dims=1 + self.geo_feat_dim,
+            n_output_dims=1 + self.geo_feat_dim + self.semantic_feat_dim,
             network_config={
                 "otype": "FullyFusedMLP",
                 "activation": "ReLU",
@@ -93,7 +93,7 @@ class NeRFNetwork(NeRFRenderer):
         )
 
         self.semantic_net = tcnn.Network(
-            n_input_dims=self.geo_feat_dim,
+            n_input_dims=self.semantic_feat_dim,
             n_output_dims=self.num_classes,
             network_config={
                 "otype": "FullyFusedMLP",
@@ -104,17 +104,8 @@ class NeRFNetwork(NeRFRenderer):
             },
         )
 
-        # Semantics encoding
-        self.encoder_semantics = tcnn.Encoding(
-            n_input_dims=self.num_classes,
-            encoding_config={
-                "otype": "oneblob",
-                "n_bins": self.n_bins,
-            },
-        )
 
-
-    def forward(self, x, d, s):
+    def forward(self, x, d):
         # x: [N, 3], in [-bound, bound]
         # d: [N, 3], nomalized in [-1, 1]
 
@@ -125,12 +116,11 @@ class NeRFNetwork(NeRFRenderer):
 
         # sigma = F.relu(h[..., 0])
         sigma = trunc_exp(h[..., 0])
-        geo_feat = h[..., 1:]
-
-        # semantics encoding
+        geo_feat = h[..., 1:self.geo_feat_dim+1]
+        semantic_feat = h[..., self.geo_feat_dim+1:self.geo_feat_dim+1+self.semantic_feat_dim].detach()
 
         # semantics
-        semantic = self.semantic_net(geo_feat)
+        semantic = self.semantic_net(semantic_feat)
         # Softmax for semantic segmentation
         # semantic = torch.log_softmax(semantic, dim=1)
         # semantic = torch.nn.functional.log_softmax(semantic, dim=1)

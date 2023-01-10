@@ -202,11 +202,16 @@ class NeRFDataset:
             self.images = []
             self.semantics = []
             self.original_name = []
+            if self.opt.dist_load:
+                self.dist_images = []
+
 
 
             for f in tqdm.tqdm(frames, desc=f'Loading {type} data'):
                 f_path = os.path.join(self.root_path, f['file_path'])
                 s_path = os.path.join(self.root_path, f['semantic_path'])
+                if self.opt.dist_load:
+                    d_path = os.path.join(self.root_path, f['dist_path'])
                 if self.mode == 'blender' and '.' not in os.path.basename(f_path):
                     f_path += '.png' # so silly...
 
@@ -220,6 +225,13 @@ class NeRFDataset:
                     print("The file", s_path, "does not exist")
                     continue
 
+                # Dist from middle of shape
+                if self.opt.dist_load:
+                    # there are non-exist paths in Dist...
+                    if not os.path.exists(d_path) and not self.opt.generate:
+                        print("The file", d_path, "does not exist")
+                        continue
+
                 pose = np.array(f['transform_matrix'], dtype=np.float32) # [4, 4]
                 # if not self.opt.generate:
                 pose = nerf_matrix_to_ngp(pose, scale=self.scale, offset=self.offset)
@@ -229,6 +241,13 @@ class NeRFDataset:
                     image = np.zeros((256, 256, 3), np.uint8)
                 else:
                     image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
+
+                # Dist from middle of shape
+                if self.opt.dist_load:
+                    if self.opt.generate:
+                        dist_image = np.zeros((256, 256, 1), np.uint8)
+                    else:
+                        dist_image = cv2.imread(d_path, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
 
                 if self.opt.generate:
                     semantic = np.zeros((256, 256, 1), np.uint8)
@@ -266,20 +285,26 @@ class NeRFDataset:
 
                 self.poses.append(pose)
                 self.images.append(image)
+                if self.opt.dist_load:
+                    self.dist_images.append(dist_image)
                 self.semantics.append(semantic)
-                if self.opt.generate:
+                if self.opt.generate or opt.generate_dist:
                     self.original_name.append(f['file_path'])
 
 
         self.poses = torch.from_numpy(np.stack(self.poses, axis=0)) # [N, 4, 4]
         if self.images is not None:
             self.images = torch.from_numpy(np.stack(self.images, axis=0)) # [N, H, W, C]
+        # Dist from middle of shape
+        if self.opt.dist_load:
+            if self.dist_images is not None:
+                self.dist_images = torch.from_numpy(np.stack(self.dist_images, axis=0)) # [N, H, W, 1]
         if self.semantics is not None:
             if self.use_class_vector:
                 self.semantics = torch.stack(self.semantics, axis=0) # [N, H, W, 1]
             else:
                 self.semantics = torch.from_numpy(np.stack(self.semantics, axis=0)) # [N, H, W, 1]
-        if self.opt.generate:
+        if self.opt.generate or opt.generate_dist:
             self.original_name = np.stack(self.original_name, axis=0) # [N, 1]
 
         # Calculate number of semantic classes
@@ -380,6 +405,13 @@ class NeRFDataset:
                 C = images.shape[-1]
                 images = torch.gather(images.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
             results['images'] = images
+        # Dist from middle of shape
+        if self.opt.dist_load:
+            if self.dist_images is not None:
+                dist_images = self.dist_images[index].to(self.device) # [B, H, W, 1]
+                if self.training:
+                    dist_images = torch.gather(dist_images.view(B, -1, 1), 1, torch.stack([rays['inds']], -1)) # [B, N, 1]
+                results['dist_images'] = dist_images
 
         if self.semantics is not None:
             semantics = self.semantics[index].to(self.device) # [B, H, W, 1]
@@ -406,7 +438,7 @@ class NeRFDataset:
             results['index'] = index
             results['inds_coarse'] = rays['inds_coarse']
 
-        if self.opt.generate:
+        if self.opt.generate or self.opt.generate_dist:
             results['original_name'] = self.original_name[index]
             
         return results
