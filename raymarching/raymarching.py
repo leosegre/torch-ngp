@@ -161,7 +161,7 @@ packbits = _packbits.apply
 class _march_rays_train(Function):
     @staticmethod
     @custom_fwd(cast_inputs=torch.float32)
-    def forward(ctx, rays_o, rays_d, bound, density_bitfield, C, H, nears, fars, step_counter=None, mean_count=-1, perturb=False, align=-1, force_all_rays=False, dt_gamma=0, max_steps=1024):
+    def forward(ctx, rays_o, rays_d, bound, density_bitfield, C, H, nears, fars, step_counter=None, mean_count=-1, perturb=False, align=-1, force_all_rays=True, dt_gamma=0, max_steps=1024):
         ''' march rays to generate points (forward only)
         Args:
             rays_o/d: float, [N, 3]

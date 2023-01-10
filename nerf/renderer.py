@@ -267,7 +267,7 @@ class NeRFRenderer(nn.Module):
         }
 
 
-    def run_cuda(self, rays_o, rays_d, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=False, max_steps=1024, T_thresh=1e-4, opt=None):
+    def run_cuda(self, rays_o, rays_d, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=True, max_steps=1024, T_thresh=1e-4, opt=None):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
         # return: image: [B, N, 3], depth: [B, N]
 

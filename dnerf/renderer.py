@@ -258,7 +258,7 @@ class NeRFRenderer(nn.Module):
         }
 
 
-    def run_cuda(self, rays_o, rays_d, time, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=False, max_steps=1024, **kwargs):
+    def run_cuda(self, rays_o, rays_d, time, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=True, max_steps=1024, **kwargs):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
         # time: [B, 1], B == 1, so only one time is used.
         # return: image: [B, N, 3], depth: [B, N]
