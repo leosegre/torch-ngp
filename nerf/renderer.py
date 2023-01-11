@@ -478,6 +478,7 @@ class NeRFRenderer(nn.Module):
             results['instance_loss_clac'] = instance_loss_calc
         return results
 
+
     @torch.no_grad()
     def mark_untrained_grid(self, poses, intrinsic, S=64):
         # poses: [B, 4, 4]
@@ -490,8 +491,7 @@ class NeRFRenderer(nn.Module):
             poses = torch.from_numpy(poses)
 
         B = poses.shape[0]
-        
-        fx, fy, cx, cy = intrinsic
+
         
         X = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
         Y = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
@@ -499,6 +499,7 @@ class NeRFRenderer(nn.Module):
 
         count = torch.zeros_like(self.density_grid)
         poses = poses.to(count.device)
+        intrinsic = intrinsic.to(count.device)
 
         # 5-level loop, forgive me...
 
@@ -527,7 +528,16 @@ class NeRFRenderer(nn.Module):
                             # world2cam transform (poses is c2w, so we need to transpose it. Another transpose is needed for batched matmul, so the final form is without transpose.)
                             cam_xyzs = cas_world_xyzs - poses[head:tail, :3, 3].unsqueeze(1)
                             cam_xyzs = cam_xyzs @ poses[head:tail, :3, :3] # [S, N, 3]
-                            
+
+                            intrinsic_part = intrinsic[head:tail]
+                            fx = intrinsic_part[..., 0].unsqueeze(-1)
+                            fy = intrinsic_part[..., 1].unsqueeze(-1)
+                            cx = intrinsic_part[..., 2].unsqueeze(-1)
+                            cy = intrinsic_part[..., 3].unsqueeze(-1)
+                            # fx, fy, cx, cy = intrinsic_part
+
+                            # print(fx.shape)
+
                             # query if point is covered by any camera
                             mask_z = cam_xyzs[:, :, 2] > 0 # [S, N]
                             mask_x = torch.abs(cam_xyzs[:, :, 0]) < cx / fx * cam_xyzs[:, :, 2] + half_grid_size * 2

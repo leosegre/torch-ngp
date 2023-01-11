@@ -158,10 +158,10 @@ class NeRFDataset:
         else:
             raise NotImplementedError(f'unknown dataset mode: {self.mode}')
 
-        # load image size
+        # load image size TODO: don't assume all images are in the same size
         if 'h' in transform and 'w' in transform:
-            self.H = int(transform['h']) // downscale
-            self.W = int(transform['w']) // downscale
+            self.H = int(transform['frames'][0]['h']) // downscale
+            self.W = int(transform['frames'][0]['w']) // downscale
         else:
             # we have to actually read an image to get H and W later.
             self.H = self.W = None
@@ -201,6 +201,7 @@ class NeRFDataset:
             self.poses = []
             self.images = []
             self.semantics = []
+            self.intrinsics = []
             self.original_name = []
             if self.opt.dist_load:
                 self.dist_images = []
@@ -283,11 +284,32 @@ class NeRFDataset:
 
                 image = image.astype(np.float32) / 255 # [H, W, 3/4]
 
+                # load intrinsics
+                if 'fl_x' in f or 'fl_y' in f:
+                    fl_x = (f['fl_x'] if 'fl_x' in f else f['fl_y']) / downscale
+                    fl_y = (f['fl_y'] if 'fl_y' in f else f['fl_x']) / downscale
+                elif 'camera_angle_x' in f or 'camera_angle_y' in f:
+                    # blender, assert in radians. already downscaled since we use H/W
+                    fl_x = self.W / (
+                                2 * np.tan(f['camera_angle_x'] / 2)) if 'camera_angle_x' in f else None
+                    fl_y = self.H / (
+                                2 * np.tan(f['camera_angle_y'] / 2)) if 'camera_angle_y' in f else None
+                    if fl_x is None: fl_x = fl_y
+                    if fl_y is None: fl_y = fl_x
+                else:
+                    raise RuntimeError('Failed to load focal length, please check the transforms.json!')
+
+                cx = (f['cx'] / downscale) if 'cx' in f else (self.W / 2)
+                cy = (f['cy'] / downscale) if 'cy' in f else (self.H / 2)
+
+                intrinsics = np.array([fl_x, fl_y, cx, cy])
+
                 self.poses.append(pose)
                 self.images.append(image)
                 if self.opt.dist_load:
                     self.dist_images.append(dist_image)
                 self.semantics.append(semantic)
+                self.intrinsics.append(intrinsics)
                 if self.opt.generate or opt.generate_dist:
                     self.original_name.append(f['file_path'])
 
@@ -296,6 +318,8 @@ class NeRFDataset:
         if self.images is not None:
             self.images = torch.from_numpy(np.stack(self.images, axis=0)) # [N, H, W, C]
         # Dist from middle of shape
+        if self.intrinsics is not None:
+            self.intrinsics = torch.from_numpy(np.stack(self.intrinsics, axis=0)) # [N, 4]
         if self.opt.dist_load:
             if self.dist_images is not None:
                 self.dist_images = torch.from_numpy(np.stack(self.dist_images, axis=0)) # [N, H, W, 1]
@@ -335,6 +359,7 @@ class NeRFDataset:
 
         if self.preload:
             self.poses = self.poses.to(self.device)
+            self.intrinsics = self.intrinsics.to(self.device)
             if self.images is not None:
                 # TODO: linear use pow, but pow for half is only available for torch >= 1.10 ?
                 if self.fp16 and self.opt.color_space != 'linear':
@@ -346,23 +371,7 @@ class NeRFDataset:
             if self.error_map is not None:
                 self.error_map = self.error_map.to(self.device)
 
-        # load intrinsics
-        if 'fl_x' in transform or 'fl_y' in transform:
-            fl_x = (transform['fl_x'] if 'fl_x' in transform else transform['fl_y']) / downscale
-            fl_y = (transform['fl_y'] if 'fl_y' in transform else transform['fl_x']) / downscale
-        elif 'camera_angle_x' in transform or 'camera_angle_y' in transform:
-            # blender, assert in radians. already downscaled since we use H/W
-            fl_x = self.W / (2 * np.tan(transform['camera_angle_x'] / 2)) if 'camera_angle_x' in transform else None
-            fl_y = self.H / (2 * np.tan(transform['camera_angle_y'] / 2)) if 'camera_angle_y' in transform else None
-            if fl_x is None: fl_x = fl_y
-            if fl_y is None: fl_y = fl_x
-        else:
-            raise RuntimeError('Failed to load focal length, please check the transforms.json!')
 
-        cx = (transform['cx'] / downscale) if 'cx' in transform else (self.W / 2)
-        cy = (transform['cy'] / downscale) if 'cy' in transform else (self.H / 2)
-    
-        self.intrinsics = np.array([fl_x, fl_y, cx, cy])
 
 
     def collate(self, index):
@@ -389,8 +398,9 @@ class NeRFDataset:
         poses = self.poses[index].to(self.device) # [B, 4, 4]
 
         error_map = None if self.error_map is None else self.error_map[index]
-        
-        rays = get_rays(poses, self.intrinsics, self.H, self.W, self.num_rays, error_map, self.opt.patch_size)
+
+
+        rays = get_rays(poses, self.intrinsics[index].squeeze(), self.H, self.W, self.num_rays, error_map, self.opt.patch_size)
 
         results = {
             'H': self.H,

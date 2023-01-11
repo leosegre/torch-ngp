@@ -1120,6 +1120,7 @@ class Trainer(object):
                         save_path = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_rgb.png')
                         save_path_semantics = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_semantics.png')
                         save_path_depth = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_depth.png')
+                        save_path_rgb_gt = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_rgb_gt.png')
                         save_path_semantics_gt = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_semantics_gt.png')
 
                     #self.log(f"==> Saving validation image to {save_path}")
@@ -1130,6 +1131,9 @@ class Trainer(object):
 
                     pred = preds[0].detach().cpu().numpy()
                     pred = (pred * 255).astype(np.uint8)
+
+                    truth = truths[0].detach().cpu().numpy()
+                    truth = (truth * 255).astype(np.uint8)
 
                     pred_depth = preds_depth[0].detach().cpu().numpy()
                     pred_depth = (pred_depth * 255).astype(np.uint8)
@@ -1159,11 +1163,11 @@ class Trainer(object):
 
                     if self.save_images:
                         cv2.imwrite(save_path, cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
+                        cv2.imwrite(save_path_rgb_gt, cv2.cvtColor(truth, cv2.COLOR_RGB2BGR))
                         if not self.opt.generate:
                             cv2.imwrite(save_path_depth, pred_depth)
                             if not self.no_seg:
                                 cv2.imwrite(save_path_semantics, pred_semantic)
-                                cv2.imwrite(save_path_semantics_gt, semantic_gt)
                                 cv2.imwrite(save_path_semantics_gt, semantic_gt)
 
                     # Calculate segmentation scores
