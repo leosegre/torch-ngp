@@ -13,11 +13,11 @@ class NeRFNetwork(NeRFRenderer):
     def __init__(self,
                  encoding="HashGrid",
                  encoding_dir="SphericalHarmonics",
-                 num_layers=3,
-                 hidden_dim=128,
-                 geo_feat_dim=31,
+                 num_layers=2,
+                 hidden_dim=64,
+                 geo_feat_dim=15,
                  num_layers_color=3,
-                 hidden_dim_color=128,
+                 hidden_dim_color=64,
                  semantic_feat_dim=15,
                  num_layers_semantic=3,
                  hidden_dim_semantic=64,
@@ -40,26 +40,27 @@ class NeRFNetwork(NeRFRenderer):
         self.semantic_feat_dim = semantic_feat_dim
         self.num_classes = num_classes
 
-        per_level_scale = np.exp2(np.log2(2048 * bound / 16) / (16 - 1))
+        self.base_resolution = 32
+        per_level_scale = np.exp2(np.log2(2048 * bound / self.base_resolution) / (self.base_resolution - 1))
 
         self.encoder = tcnn.Encoding(
             n_input_dims=3,
             encoding_config={
                 "otype": "HashGrid",
-                "n_levels": 16,
+                "n_levels": self.base_resolution,
                 "n_features_per_level": 2,
-                "log2_hashmap_size": 19,
-                "base_resolution": 16,
+                "log2_hashmap_size": 20,
+                "base_resolution": self.base_resolution,
                 "per_level_scale": per_level_scale,
             },
         )
 
         self.sigma_net = tcnn.Network(
-            n_input_dims=32,
+            n_input_dims=2 * self.base_resolution,
             n_output_dims=1 + self.geo_feat_dim + self.semantic_feat_dim,
             network_config={
                 "otype": "FullyFusedMLP",
-                "activation": "ReLU",
+                "activation": "Sine",
                 "output_activation": "None",
                 "n_neurons": hidden_dim,
                 "n_hidden_layers": num_layers - 1,
@@ -85,7 +86,7 @@ class NeRFNetwork(NeRFRenderer):
             n_output_dims=3,
             network_config={
                 "otype": "FullyFusedMLP",
-                "activation": "ReLU",
+                "activation": "Sine",
                 "output_activation": "None",
                 "n_neurons": hidden_dim_color,
                 "n_hidden_layers": num_layers_color - 1,
@@ -97,7 +98,7 @@ class NeRFNetwork(NeRFRenderer):
             n_output_dims=self.num_classes,
             network_config={
                 "otype": "FullyFusedMLP",
-                "activation": "ReLU",
+                "activation": "Sine",
                 "output_activation": "None",
                 "n_neurons": hidden_dim_semantic,
                 "n_hidden_layers": num_layers_semantic - 1,
