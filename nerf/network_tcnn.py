@@ -40,8 +40,9 @@ class NeRFNetwork(NeRFRenderer):
         self.semantic_feat_dim = semantic_feat_dim
         self.num_classes = num_classes
 
+        self.base_resolution = 16
         self.n_levels = 32
-        per_level_scale = np.exp2(np.log2(8192 * bound / 16) / (self.n_levels - 1))
+        per_level_scale = np.exp2(np.log2(32768 * bound / self.base_resolution) / (self.n_levels - 1))
 
         self.encoder = tcnn.Encoding(
             n_input_dims=3,
@@ -49,8 +50,8 @@ class NeRFNetwork(NeRFRenderer):
                 "otype": "HashGrid",
                 "n_levels": self.n_levels,
                 "n_features_per_level": 2,
-                "log2_hashmap_size": 20,
-                "base_resolution": 16,
+                "log2_hashmap_size": 21,
+                "base_resolution": self.base_resolution,
                 "per_level_scale": per_level_scale,
             },
         )
