@@ -505,6 +505,9 @@ class Trainer(object):
         # MSE loss
         loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
 
+        # if loss.mean(-1).item() > 0.02:
+        #     print(data['original_name'][0])
+
         # Cross Entropy Loss
         # pred_squeezed = pred_semantic.squeeze()
         # gt_squeezed = gt_semantic.squeeze()

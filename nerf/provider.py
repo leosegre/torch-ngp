@@ -27,7 +27,7 @@ def nerf_matrix_to_ngp(pose, scale=0.33, offset=[0, 0, 0]):
     return new_pose
 
 
-def visualize_poses(poses, size=0.1):
+def visualize_poses(poses, size=0.1, bound=1.0):
     # poses: [B, 4, 4]
 
     axes = trimesh.creation.axis(axis_length=4)
@@ -159,7 +159,7 @@ class NeRFDataset:
             raise NotImplementedError(f'unknown dataset mode: {self.mode}')
 
         # load image size TODO: don't assume all images are in the same size
-        if 'h' in transform and 'w' in transform:
+        if 'h' in transform['frames'][0] and 'w' in transform['frames'][0]:
             self.H = int(transform['frames'][0]['h']) // downscale
             self.W = int(transform['frames'][0]['w']) // downscale
         else:
@@ -210,7 +210,8 @@ class NeRFDataset:
 
             for f in tqdm.tqdm(frames, desc=f'Loading {type} data'):
                 f_path = os.path.join(self.root_path, f['file_path'])
-                s_path = os.path.join(self.root_path, f['semantic_path'])
+                if not self.opt.no_seg:
+                    s_path = os.path.join(self.root_path, f['semantic_path'])
                 if self.opt.dist_load:
                     d_path = os.path.join(self.root_path, f['dist_path'])
                 if self.mode == 'blender' and '.' not in os.path.basename(f_path):
@@ -221,10 +222,11 @@ class NeRFDataset:
                     print("The file", f_path, "does not exist")
                     continue
 
-                # there are non-exist paths in Semantic...
-                if not os.path.exists(s_path) and not self.opt.generate:
-                    print("The file", s_path, "does not exist")
-                    continue
+                if not self.opt.no_seg:
+                    # there are non-exist paths in Semantic...
+                    if not os.path.exists(s_path) and not self.opt.generate:
+                        print("The file", s_path, "does not exist")
+                        continue
 
                 # Dist from middle of shape
                 if self.opt.dist_load:
@@ -250,8 +252,9 @@ class NeRFDataset:
                     else:
                         dist_image = cv2.imread(d_path, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
 
-                if self.opt.generate:
-                    semantic = np.zeros((256, 256, 1), np.uint8)
+                # if not self.opt.no_seg:
+                if self.opt.generate | self.opt.no_seg:
+                    semantic = np.zeros((self.H, self.W, 1), np.uint8)
                 else:
                     if self.use_class_vector:
                         for class_num in range(self.num_classes):
@@ -278,6 +281,7 @@ class NeRFDataset:
                 else:
                     image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
 
+                # print(self.H)
                 if image.shape[0] != self.H or image.shape[1] != self.W:
                     image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
                     semantic = cv2.resize(semantic, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
@@ -304,16 +308,17 @@ class NeRFDataset:
 
                 intrinsics = np.array([fl_x, fl_y, cx, cy])
 
+                # print(pose)
                 self.poses.append(pose)
                 self.images.append(image)
                 if self.opt.dist_load:
                     self.dist_images.append(dist_image)
                 self.semantics.append(semantic)
                 self.intrinsics.append(intrinsics)
-                if self.opt.generate or opt.generate_dist:
-                    self.original_name.append(f['file_path'])
+                # if self.opt.generate or opt.generate_dist:
+                self.original_name.append(f['file_path'])
 
-
+        # print(self.poses)
         self.poses = torch.from_numpy(np.stack(self.poses, axis=0)) # [N, 4, 4]
         if self.images is not None:
             self.images = torch.from_numpy(np.stack(self.images, axis=0)) # [N, H, W, C]
@@ -328,8 +333,8 @@ class NeRFDataset:
                 self.semantics = torch.stack(self.semantics, axis=0) # [N, H, W, 1]
             else:
                 self.semantics = torch.from_numpy(np.stack(self.semantics, axis=0)) # [N, H, W, 1]
-        if self.opt.generate or opt.generate_dist:
-            self.original_name = np.stack(self.original_name, axis=0) # [N, 1]
+        # if self.opt.generate or opt.generate_dist:
+        self.original_name = np.stack(self.original_name, axis=0) # [N, 1]
 
         # Calculate number of semantic classes
         # if self.opt.use_class_vector:
@@ -448,8 +453,8 @@ class NeRFDataset:
             results['index'] = index
             results['inds_coarse'] = rays['inds_coarse']
 
-        if self.opt.generate or self.opt.generate_dist:
-            results['original_name'] = self.original_name[index]
+        # if self.opt.generate or self.opt.generate_dist:
+        results['original_name'] = self.original_name[index]
             
         return results
 

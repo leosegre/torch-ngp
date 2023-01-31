@@ -139,6 +139,8 @@ class NeRFNetwork(NeRFRenderer):
 
         # print(semantic.sum(axis=1))
 
+
+
         return sigma, color, semantic
 
     def density(self, x):

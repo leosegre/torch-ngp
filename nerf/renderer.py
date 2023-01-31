@@ -142,10 +142,12 @@ class NeRFRenderer(nn.Module):
         # choose aabb
         aabb = self.aabb_train if self.training else self.aabb_infer
 
+
         # sample steps
         nears, fars = raymarching.near_far_from_aabb(rays_o, rays_d, aabb, self.min_near)
         nears.unsqueeze_(-1)
         fars.unsqueeze_(-1)
+
 
         #print(f'nears = {nears.min().item()} ~ {nears.max().item()}, fars = {fars.min().item()} ~ {fars.max().item()}')
 
@@ -278,8 +280,13 @@ class NeRFRenderer(nn.Module):
         N = rays_o.shape[0] # N = B * N, in fact
         device = rays_o.device
 
+        # print(self.aabb_train)
+
         # pre-calculate near far
         nears, fars = raymarching.near_far_from_aabb(rays_o, rays_d, self.aabb_train if self.training else self.aabb_infer, self.min_near)
+        # print()
+        # print("nears:", nears.min(), nears.max())
+        # print("fars:", fars.min(), fars.max())
 
         # mix background color
         if self.bg_radius > 0:
@@ -299,6 +306,10 @@ class NeRFRenderer(nn.Module):
 
             # print(self.density_bitfield)
             xyzs, dirs, deltas, rays = raymarching.march_rays_train(rays_o, rays_d, self.bound, self.density_bitfield, self.cascade, self.grid_size, nears, fars, counter, self.mean_count, perturb, 128, force_all_rays, dt_gamma, max_steps)
+            # print()
+            # print(xyzs.min(), xyzs.max())
+            # if torch.abs(xyzs).max() > self.bound:
+            #     print(torch.abs(xyzs).max())
 
             #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
 

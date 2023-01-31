@@ -2,6 +2,7 @@ import torch
 import argparse
 
 from nerf.provider import NeRFDataset
+from nerf.provider import visualize_poses
 from nerf.gui import NeRFGUI
 from nerf.utils import *
 
@@ -77,6 +78,9 @@ if __name__ == '__main__':
     parser.add_argument('--generate', action='store_true', help="Generate more data, the original images does not exist")
     parser.add_argument('--generate_dist', action='store_true', help="Generate distance map")
     parser.add_argument('--save_mesh', action='store_true', help="Save mesh")
+
+    parser.add_argument('--vis_poses', action='store_true', help="Visualize poses")
+
 
 
 
@@ -203,6 +207,9 @@ if __name__ == '__main__':
         
         else:
             valid_loader = NeRFDataset(opt, device=device, type='val', downscale=1, num_classes=opt.num_classes, use_class_vector=opt.use_class_vector).dataloader()
+
+            if opt.vis_poses:
+                visualize_poses(poses=train_loader._data.poses.numpy(), bound=opt.bound)
 
             max_epoch = np.ceil(opt.iters / len(train_loader)).astype(np.int32)
             trainer.train(train_loader, valid_loader, max_epoch)
