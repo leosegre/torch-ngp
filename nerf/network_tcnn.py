@@ -40,23 +40,23 @@ class NeRFNetwork(NeRFRenderer):
         self.semantic_feat_dim = semantic_feat_dim
         self.num_classes = num_classes
 
-        self.base_resolution = 32
-        per_level_scale = np.exp2(np.log2(2048 * bound / self.base_resolution) / (self.base_resolution - 1))
+        self.n_levels = 32
+        per_level_scale = np.exp2(np.log2(8192 * bound / 16) / (self.n_levels - 1))
 
         self.encoder = tcnn.Encoding(
             n_input_dims=3,
             encoding_config={
                 "otype": "HashGrid",
-                "n_levels": self.base_resolution,
+                "n_levels": self.n_levels,
                 "n_features_per_level": 2,
                 "log2_hashmap_size": 20,
-                "base_resolution": self.base_resolution,
+                "base_resolution": 16,
                 "per_level_scale": per_level_scale,
             },
         )
 
         self.sigma_net = tcnn.Network(
-            n_input_dims=2 * self.base_resolution,
+            n_input_dims=2 * self.n_levels,
             n_output_dims=1 + self.geo_feat_dim + self.semantic_feat_dim,
             network_config={
                 "otype": "FullyFusedMLP",
